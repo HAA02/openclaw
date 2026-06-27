@@ -7,10 +7,6 @@
   "enabledByDefault": false,
   "tools": [
     {
-      "name": "consilium_health",
-      "optional": true
-    },
-    {
       "name": "consilium_debate",
       "optional": true
     },
@@ -23,14 +19,10 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "ollamaUrl": {
-        "type": "string",
-        "description": "Ollama API URL (기본값: http://127.0.0.1:11434)"
-      },
       "defaultModels": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "기본 모델 목록 (예: [\"llama3.2\", \"qwen2.5-coder\"])"
+        "description": "기본 모델 이름 목록 (예: [\"qwen3:8b\", \"qwen2.5-coder\"]). ollama/ 접두사는 자동 부여."
       },
       "maxIterations": {
         "type": "integer",
@@ -41,13 +33,9 @@
     }
   },
   "uiHints": {
-    "ollamaUrl": {
-      "label": "Ollama URL",
-      "help": "로컬 Ollama 서버 주소. 기본값: http://127.0.0.1:11434"
-    },
     "defaultModels": {
       "label": "기본 모델",
-      "help": "토론/goal에 사용할 Ollama 모델 목록."
+      "help": "토론/goal에 사용할 모델 이름 목록 (예: qwen3:8b)."
     },
     "maxIterations": {
       "label": "최대 반복",

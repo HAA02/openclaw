@@ -1,9 +1,15 @@
 // Consilium plugin — multi-model debate and goal-driven dev loop, native to OpenClaw.
-// No external server needed: calls Ollama directly via fetch().
+// Inference routes through the host provider stack (api.runtime.llm.complete), so any
+// provider works; for local models, configure the bundled `ollama` provider.
+//
+// Multi-model fan-out passes an explicit model ref per call, which the host treats as a
+// model override. That is gated per-plugin, so operators must allow it in openclaw.json:
+//   plugins.entries.consilium.llm = { allowModelOverride: true, allowedModels: ["*"] }
+// (or an explicit ref list). Without it, the host refuses the override.
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { Type } from "typebox";
+import type { CompleteFn } from "./src/llm.runtime.js";
 
-const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
 const DEFAULT_MODELS = ["llama3.2"];
 const DEFAULT_MAX_ITERATIONS = 10;
 
@@ -12,17 +18,33 @@ let _rt: Promise<Runtime> | undefined;
 const rt = (): Promise<Runtime> => (_rt ??= import("./src/consilium.runtime.js"));
 
 type Cfg = {
-  ollamaUrl?: string;
   defaultModels?: string[];
   maxIterations?: number;
   auditLogPath?: string;
 };
 function cfg(c: Cfg) {
   return {
-    ollamaUrl: c.ollamaUrl ?? DEFAULT_OLLAMA_URL,
     models: c.defaultModels ?? DEFAULT_MODELS,
     maxIterations: c.maxIterations ?? DEFAULT_MAX_ITERATIONS,
     auditLogPath: c.auditLogPath,
+  };
+}
+
+// Adapt the host LLM seam into the transport-agnostic CompleteFn the runtimes consume.
+// model is a bare id (e.g. "qwen3:8b") mapped to an "ollama/<id>" host model ref.
+function buildComplete(
+  llm: { complete: (p: never) => Promise<{ text: string }> },
+  purpose: string,
+): CompleteFn {
+  return async ({ model, messages, temperature, signal }) => {
+    const res = await llm.complete({
+      model: `ollama/${model}`,
+      messages,
+      temperature,
+      signal,
+      purpose,
+    } as never);
+    return res.text;
   };
 }
 
@@ -30,17 +52,13 @@ export default defineToolPlugin({
   id: "consilium",
   name: "Consilium",
   description:
-    "로컬 Ollama 모델을 사용한 멀티모델 토론, goal 기반 코드 생성 루프. 별도 서버 불필요.",
+    "여러 로컬 모델이 토론하고, goal 기반으로 코드를 생성·검증하는 루프. 호스트 프로바이더 스택을 통해 추론합니다.",
   configSchema: Type.Object(
     {
-      ollamaUrl: Type.Optional(
-        Type.String({
-          description: "Ollama API URL (기본값: http://127.0.0.1:11434)",
-        }),
-      ),
       defaultModels: Type.Optional(
         Type.Array(Type.String(), {
-          description: '기본 모델 목록 (예: ["llama3.2", "qwen2.5-coder"])',
+          description:
+            '기본 모델 이름 목록 (예: ["qwen3:8b", "qwen2.5-coder"]). ollama/ 접두사는 자동 부여.',
         }),
       ),
       maxIterations: Type.Optional(
@@ -54,37 +72,19 @@ export default defineToolPlugin({
   ),
 
   tools: (tool) => [
-    // ── Health ──────────────────────────────────────────────────────────────
-    tool({
-      name: "consilium_health",
-      label: "Consilium 상태",
-      description: "Ollama 연결 확인 및 사용 가능한 모델 목록 조회.",
-      optional: true,
-      parameters: Type.Object({}, { additionalProperties: false }),
-      execute: async (_p, config, { signal }) => {
-        const { ollamaUrl } = cfg(config);
-        const { listModels } = await rt();
-        const models = await listModels(ollamaUrl, signal);
-        if (models.length === 0) {
-          return { ok: false, ollamaUrl, error: "Ollama에 연결할 수 없거나 모델이 없습니다." };
-        }
-        return { ok: true, ollamaUrl, models: models.map((m) => m.name) };
-      },
-    }),
-
     // ── Debate ──────────────────────────────────────────────────────────────
     tool({
       name: "consilium_debate",
       label: "Consilium 토론",
       description:
-        "여러 Ollama 모델이 주제를 라운드별로 토론합니다. 합의 감지 시 조기 종료. 요약과 전체 발언 기록을 반환합니다.",
+        "여러 모델이 주제를 라운드별로 토론합니다. 합의 감지 시 조기 종료. 요약과 전체 발언 기록을 반환합니다.",
       optional: true,
       parameters: Type.Object(
         {
           topic: Type.String({ description: "토론 주제 또는 질문." }),
           models: Type.Optional(
             Type.Array(Type.String(), {
-              description: "사용할 Ollama 모델 이름 목록. 미지정 시 플러그인 기본값 사용.",
+              description: "사용할 모델 이름 목록. 미지정 시 플러그인 기본값 사용.",
             }),
           ),
           rounds: Type.Optional(
@@ -104,12 +104,13 @@ export default defineToolPlugin({
         },
         { additionalProperties: false },
       ),
-      execute: async (params, config, { signal, onUpdate }) => {
+      execute: async (params, config, { signal, onUpdate, api }) => {
         const c = cfg(config);
         const { runDebate } = await rt();
+        const complete = buildComplete(api.runtime.llm, "consilium-debate");
 
         const result = await runDebate(
-          c.ollamaUrl,
+          complete,
           {
             topic: params.topic,
             models: params.models ?? c.models,
@@ -161,7 +162,7 @@ export default defineToolPlugin({
           }),
           models: Type.Optional(
             Type.Array(Type.String(), {
-              description: "사용할 Ollama 모델 목록. 라운드마다 순환 사용됩니다.",
+              description: "사용할 모델 목록. 라운드마다 순환 사용됩니다.",
             }),
           ),
           verify_cmd: Type.Optional(
@@ -177,12 +178,13 @@ export default defineToolPlugin({
         },
         { additionalProperties: false },
       ),
-      execute: async (params, config, { signal, onUpdate }) => {
+      execute: async (params, config, { signal, onUpdate, api }) => {
         const c = cfg(config);
         const { runGoalLoop } = await rt();
+        const complete = buildComplete(api.runtime.llm, "consilium-goal");
 
         const result = await runGoalLoop(
-          c.ollamaUrl,
+          complete,
           {
             goal: params.goal,
             models: params.models ?? c.models,
