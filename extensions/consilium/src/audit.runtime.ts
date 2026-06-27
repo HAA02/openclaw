@@ -1,9 +1,6 @@
-// Audit log for consilium goal/debate runs.
-// Appends JSONL entries to a user-configured path.
-// TODO: migrate to openclaw SQLite (state/openclaw.sqlite) after Kysely helper is stable.
-
-import { appendFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+// Audit log for consilium debate/goal runs. Persisted via the host SQLite plugin-state
+// keyed store (api.runtime.state.openKeyedStore) — no JSON/JSONL sidecar files.
+// The store is opened in index.ts and passed in as a structural sink so this stays testable.
 
 export type AuditEntry = {
   ts: string; // ISO timestamp
@@ -16,7 +13,10 @@ export type AuditEntry = {
   error?: string;
 };
 
-export async function appendAuditLog(logPath: string, entry: AuditEntry): Promise<void> {
-  await mkdir(dirname(logPath), { recursive: true });
-  await appendFile(logPath, JSON.stringify(entry) + "\n", "utf8");
+// Minimal structural view of the host keyed store — avoids importing core state types.
+export type AuditSink = { register(key: string, value: AuditEntry): Promise<void> };
+
+// Best-effort: audit must never break a tool call.
+export async function recordAudit(sink: AuditSink, key: string, entry: AuditEntry): Promise<void> {
+  await sink.register(key, entry).catch(() => {});
 }

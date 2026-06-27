@@ -7,7 +7,7 @@
  * 프로덕션 추론은 api.runtime.llm.complete 를 통해 라우팅됩니다. 이 라이브 테스트는
  * 호스트 런타임 없이 동작하도록 로컬 fetch 기반 CompleteFn 으로 동일한 엔진을 검증합니다.
  */
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -172,35 +172,31 @@ describe.skipIf(!LIVE)("E2E: consilium_goal (파일 적용 + 검증)", () => {
 
 // ── 7. Audit Log E2E ─────────────────────────────────────────────────────────
 describe.skipIf(!LIVE)("E2E: audit log 실제 기록 확인", () => {
-  it("goal 실행 후 JSONL 파일에 항목 기록", { timeout: 180_000 }, async () => {
+  it("goal 실행 후 감사 항목이 sink에 기록된다", { timeout: 180_000 }, async () => {
     const { runGoalLoop } = await import("./src/goal-loop.runtime.js");
-    const { appendAuditLog } = await import("./src/audit.runtime.js");
-    const tmpDir = await mkdtemp(join(tmpdir(), "consilium-audit-e2e-"));
-    const auditPath = join(tmpDir, "consilium-audit.jsonl");
-    try {
-      const result = await runGoalLoop(
-        liveComplete,
-        {
-          goal: "Write a TypeScript const greeting = 'hello'",
-          models: [MODEL_A],
-          maxIterations: 2,
-        },
-        () => {},
-      );
-      await appendAuditLog(auditPath, {
-        ts: new Date().toISOString(),
-        tool: "goal",
-        models: [MODEL_A],
-        input: "Write a TypeScript const greeting = 'hello'",
-        status: result.status,
-        iterations: result.iterations,
-      });
-      const entry = JSON.parse((await readFile(auditPath, "utf8")).trim());
-      console.log(`✅ 감사 로그 기록됨: tool=${entry.tool} status=${entry.status}`);
-      expect(entry.tool).toBe("goal");
-      expect(entry.models).toContain(MODEL_A);
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true });
-    }
+    const { recordAudit } = await import("./src/audit.runtime.js");
+    const rows = new Map<string, { tool: string; status: string; models: string[] }>();
+    const sink = {
+      register: async (key: string, value: { tool: string; status: string; models: string[] }) => {
+        rows.set(key, value);
+      },
+    };
+    const result = await runGoalLoop(
+      liveComplete,
+      { goal: "Write a TypeScript const greeting = 'hello'", models: [MODEL_A], maxIterations: 2 },
+      () => {},
+    );
+    await recordAudit(sink, "e2e-run", {
+      ts: new Date().toISOString(),
+      tool: "goal",
+      models: [MODEL_A],
+      input: "Write a TypeScript const greeting = 'hello'",
+      status: result.status,
+      iterations: result.iterations,
+    });
+    const entry = rows.get("e2e-run")!;
+    console.log(`✅ 감사 기록됨: tool=${entry.tool} status=${entry.status}`);
+    expect(entry.tool).toBe("goal");
+    expect(entry.models).toContain(MODEL_A);
   });
 });

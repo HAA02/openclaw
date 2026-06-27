@@ -8,10 +8,13 @@
 // (or an explicit ref list). Without it, the host refuses the override.
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { Type } from "typebox";
+import type { AuditEntry } from "./src/audit.runtime.js";
 import type { CompleteFn } from "./src/llm.runtime.js";
 
 const DEFAULT_MODELS = ["llama3.2"];
 const DEFAULT_MAX_ITERATIONS = 10;
+const AUDIT_NS = "consilium-audit";
+const AUDIT_MAX_ENTRIES = 1000;
 
 type Runtime = typeof import("./src/consilium.runtime.js");
 let _rt: Promise<Runtime> | undefined;
@@ -20,14 +23,30 @@ const rt = (): Promise<Runtime> => (_rt ??= import("./src/consilium.runtime.js")
 type Cfg = {
   defaultModels?: string[];
   maxIterations?: number;
-  auditLogPath?: string;
 };
 function cfg(c: Cfg) {
   return {
     models: c.defaultModels ?? DEFAULT_MODELS,
     maxIterations: c.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-    auditLogPath: c.auditLogPath,
   };
+}
+
+// Append one audit row to the host SQLite plugin-state store (best-effort).
+async function audit(
+  state: {
+    openKeyedStore: <T>(o: { namespace: string; maxEntries: number }) => {
+      register(key: string, value: T): Promise<void>;
+    };
+  },
+  key: string,
+  entry: AuditEntry,
+): Promise<void> {
+  const { recordAudit } = await rt();
+  const store = state.openKeyedStore<AuditEntry>({
+    namespace: AUDIT_NS,
+    maxEntries: AUDIT_MAX_ENTRIES,
+  });
+  await recordAudit(store, key, entry);
 }
 
 // Adapt the host LLM seam into the transport-agnostic CompleteFn the runtimes consume.
@@ -63,9 +82,6 @@ export default defineToolPlugin({
       ),
       maxIterations: Type.Optional(
         Type.Integer({ minimum: 1, maximum: 50, description: "goal 루프 기본 최대 반복 횟수" }),
-      ),
-      auditLogPath: Type.Optional(
-        Type.String({ description: "실행 감사 로그 파일 경로 (JSONL). 미지정 시 로깅 비활성." }),
       ),
     },
     { additionalProperties: false },
@@ -104,7 +120,7 @@ export default defineToolPlugin({
         },
         { additionalProperties: false },
       ),
-      execute: async (params, config, { signal, onUpdate, api }) => {
+      execute: async (params, config, { signal, onUpdate, api, toolCallId }) => {
         const c = cfg(config);
         const { runDebate } = await rt();
         const complete = buildComplete(api.runtime.llm, "consilium-debate");
@@ -126,19 +142,16 @@ export default defineToolPlugin({
           signal,
         );
 
-        if (result.status === "failed") throw new Error(result.error ?? "토론 실패");
+        await audit(api.runtime.state, toolCallId, {
+          ts: new Date().toISOString(),
+          tool: "debate",
+          models: params.models ?? c.models,
+          input: params.topic.slice(0, 200),
+          status: result.status,
+          rounds_completed: result.rounds_completed,
+        });
 
-        if (c.auditLogPath) {
-          const { appendAuditLog } = await rt();
-          await appendAuditLog(c.auditLogPath, {
-            ts: new Date().toISOString(),
-            tool: "debate",
-            models: params.models ?? c.models,
-            input: params.topic.slice(0, 200),
-            status: result.status,
-            rounds_completed: result.rounds_completed,
-          }).catch(() => {});
-        }
+        if (result.status === "failed") throw new Error(result.error ?? "토론 실패");
         return result;
       },
     }),
@@ -178,7 +191,7 @@ export default defineToolPlugin({
         },
         { additionalProperties: false },
       ),
-      execute: async (params, config, { signal, onUpdate, api }) => {
+      execute: async (params, config, { signal, onUpdate, api, toolCallId }) => {
         const c = cfg(config);
         const { runGoalLoop } = await rt();
         const complete = buildComplete(api.runtime.llm, "consilium-goal");
@@ -201,18 +214,15 @@ export default defineToolPlugin({
           signal,
         );
 
-        if (c.auditLogPath) {
-          const { appendAuditLog } = await rt();
-          await appendAuditLog(c.auditLogPath, {
-            ts: new Date().toISOString(),
-            tool: "goal",
-            models: params.models ?? c.models,
-            input: params.goal.slice(0, 200),
-            status: result.status,
-            iterations: result.iterations,
-            error: result.error,
-          }).catch(() => {});
-        }
+        await audit(api.runtime.state, toolCallId, {
+          ts: new Date().toISOString(),
+          tool: "goal",
+          models: params.models ?? c.models,
+          input: params.goal.slice(0, 200),
+          status: result.status,
+          iterations: result.iterations,
+          error: result.error,
+        });
 
         if (result.status === "failed") {
           return {
