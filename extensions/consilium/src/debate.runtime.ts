@@ -1,7 +1,7 @@
 // Multi-model debate engine. Models take turns per round; consensus triggers early stop.
+// Transport is injected (CompleteFn) so the engine is provider-agnostic and testable.
 
-import type { OllamaMessage } from "./ollama.runtime.js";
-import { ollamaChat } from "./ollama.runtime.js";
+import type { CompleteFn, LlmMsg } from "./llm.runtime.js";
 
 export type DebateMode = "debate" | "expert" | "code" | "prd";
 
@@ -32,8 +32,8 @@ function buildMessages(
   mode: DebateMode,
   turns: DebateTurn[],
   round: number,
-): OllamaMessage[] {
-  const msgs: OllamaMessage[] = [{ role: "system", content: SYSTEM[mode](topic) }];
+): LlmMsg[] {
+  const msgs: LlmMsg[] = [{ role: "system", content: SYSTEM[mode](topic) }];
   for (const t of turns) {
     msgs.push({ role: "user", content: `[${t.model} · R${t.round + 1}]: ${t.content}` });
   }
@@ -67,7 +67,7 @@ function hasConsensus(turns: DebateTurn[], round: number, numModels: number): bo
 }
 
 export async function runDebate(
-  ollamaUrl: string,
+  complete: CompleteFn,
   params: {
     topic: string;
     models: string[];
@@ -87,13 +87,12 @@ export async function runDebate(
 
       let content: string;
       try {
-        content = await ollamaChat(
-          ollamaUrl,
+        content = await complete({
           model,
-          buildMessages(topic, mode, turns, r),
-          { temperature: 0.75 },
+          messages: buildMessages(topic, mode, turns, r),
+          temperature: 0.75,
           signal,
-        );
+        });
       } catch (err) {
         content = `[오류: ${err instanceof Error ? err.message : String(err)}]`;
       }
@@ -110,7 +109,7 @@ export async function runDebate(
 
   // Summary by the first model
   onToken("요약 생성 중…");
-  const summaryMsgs: OllamaMessage[] = [
+  const summaryMsgs: LlmMsg[] = [
     {
       role: "system",
       content:
@@ -124,7 +123,7 @@ export async function runDebate(
 
   let summary: string;
   try {
-    summary = await ollamaChat(ollamaUrl, models[0], summaryMsgs, { temperature: 0.2 }, signal);
+    summary = await complete({ model: models[0], messages: summaryMsgs, temperature: 0.2, signal });
   } catch {
     summary = turns.map((t) => `• ${t.model}: ${t.content.slice(0, 80)}`).join("\n");
   }

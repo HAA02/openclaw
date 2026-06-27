@@ -4,8 +4,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { OllamaMessage } from "./ollama.runtime.js";
-import { ollamaChat } from "./ollama.runtime.js";
+import type { CompleteFn } from "./llm.runtime.js";
 
 export type GoalResult = {
   status: "done" | "failed";
@@ -82,7 +81,7 @@ function goalSystemPrompt(goal: string, feedback: string): string {
 
 // Multi-model roundtable: each model proposes, first model is used as primary.
 async function roundtable(
-  ollamaUrl: string,
+  complete: CompleteFn,
   models: string[],
   goal: string,
   feedback: string,
@@ -92,31 +91,29 @@ async function roundtable(
   onProgress(`roundtable:${models.join(",")}`);
 
   if (models.length === 1) {
-    return ollamaChat(
-      ollamaUrl,
-      models[0],
-      [
+    return complete({
+      model: models[0],
+      messages: [
         { role: "system", content: goalSystemPrompt(goal, feedback) },
         { role: "user", content: `Implement the goal now.` },
       ],
-      { temperature: 0.5 },
+      temperature: 0.5,
       signal,
-    );
+    });
   }
 
   // Multiple models: each proposes independently, then primary synthesizes
   const proposals = await Promise.all(
     models.map((m) =>
-      ollamaChat(
-        ollamaUrl,
-        m,
-        [
+      complete({
+        model: m,
+        messages: [
           { role: "system", content: goalSystemPrompt(goal, feedback) },
           { role: "user", content: `Implement the goal now.` },
         ],
-        { temperature: 0.5 },
+        temperature: 0.5,
         signal,
-      ).catch((err) => `[${m} failed: ${err instanceof Error ? err.message : String(err)}]`),
+      }).catch((err) => `[${m} failed: ${err instanceof Error ? err.message : String(err)}]`),
     ),
   );
 
@@ -134,7 +131,7 @@ async function roundtable(
 }
 
 export async function runGoalLoop(
-  ollamaUrl: string,
+  complete: CompleteFn,
   params: {
     goal: string;
     models: string[];
@@ -156,7 +153,7 @@ export async function runGoalLoop(
     // Generate files via roundtable
     let response: string;
     try {
-      response = await roundtable(ollamaUrl, models, goal, feedback, onProgress, signal);
+      response = await roundtable(complete, models, goal, feedback, onProgress, signal);
     } catch (err) {
       return { status: "failed", goal, iterations: i + 1, summary: "", error: String(err) };
     }
