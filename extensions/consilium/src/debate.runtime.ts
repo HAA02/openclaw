@@ -7,14 +7,21 @@ export type DebateMode = "debate" | "expert" | "code" | "prd";
 
 export type DebateTurn = { model: string; round: number; content: string };
 
+// Structured judge verdict — replaces the old substring/keyword consensus heuristic.
+export type ConsensusVerdict = { agreed: boolean; confidence: number; reason: string };
+
 export type DebateResult = {
   status: "done" | "failed";
   topic: string;
   turns: DebateTurn[];
   summary: string;
   rounds_completed: number;
+  consensus?: ConsensusVerdict;
   error?: string;
 };
+
+// Minimum judge confidence to early-stop a debate on agreement.
+const CONSENSUS_CONFIDENCE_THRESHOLD = 0.6;
 
 const SYSTEM: Record<DebateMode, (topic: string) => string> = {
   debate: (t) =>
@@ -47,23 +54,38 @@ function buildMessages(
   return msgs;
 }
 
-// Agreement/dissent heuristic — port of Consilium's consensus.py free/expert mode
-function hasConsensus(turns: DebateTurn[], round: number, numModels: number): boolean {
-  if (round < 1) return false;
-  const roundTurns = turns.filter((t) => t.round === round);
-  if (roundTurns.length < numModels) return false;
+// Judge prompt: a neutral model decides whether the round reached substantive consensus.
+function buildJudgeMessages(topic: string, roundTurns: DebateTurn[]): LlmMsg[] {
+  return [
+    {
+      role: "system",
+      content:
+        "You are a neutral debate judge. Decide whether the participants reached substantive consensus. " +
+        "Respond with ONLY a JSON object, no prose, no markdown fences: " +
+        '{"agreed": boolean, "confidence": number between 0 and 1, "reason": short string}.',
+    },
+    {
+      role: "user",
+      content: `Topic: "${topic}"\n\nLatest round:\n${roundTurns
+        .map((t) => `[${t.model}]: ${t.content}`)
+        .join("\n\n")}`,
+    },
+  ];
+}
 
-  const agree = ["agree", "concur", "correct", "exactly", "동의", "맞습니다", "같습니다", "indeed"];
-  const dissent = ["disagree", "however", "but", "contrary", "반면", "하지만", "그러나", "wrong"];
-
-  let totalAgree = 0;
-  let totalDissent = 0;
-  for (const t of roundTurns) {
-    const text = t.content.toLowerCase();
-    totalAgree += agree.filter((k) => text.includes(k)).length;
-    totalDissent += dissent.filter((k) => text.includes(k)).length;
+// Extract the first JSON object from judge output (models often wrap it in prose/fences).
+function parseVerdict(text: string): ConsensusVerdict | null {
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]) as { agreed?: unknown; confidence?: unknown; reason?: unknown };
+    if (typeof o.agreed !== "boolean") return null;
+    const confidence =
+      typeof o.confidence === "number" ? Math.max(0, Math.min(1, o.confidence)) : 0;
+    return { agreed: o.agreed, confidence, reason: String(o.reason ?? "") };
+  } catch {
+    return null;
   }
-  return totalAgree / numModels >= 2.0 && totalDissent / numModels <= 1.5;
 }
 
 export async function runDebate(
@@ -79,6 +101,7 @@ export async function runDebate(
 ): Promise<DebateResult> {
   const { topic, models, rounds, mode } = params;
   const turns: DebateTurn[] = [];
+  let consensus: ConsensusVerdict | undefined;
 
   for (let r = 0; r < rounds; r++) {
     for (const model of models) {
@@ -101,9 +124,27 @@ export async function runDebate(
       onToken(`[${model}] ${content.slice(0, 90).replace(/\n/g, " ")}…`);
     }
 
-    if (hasConsensus(turns, r, models.length)) {
-      onToken(`R${r + 1}에서 합의 감지 — 조기 종료`);
-      break;
+    // Judge the round (skip round 0 — no prior positions to converge on yet).
+    if (r >= 1) {
+      onToken(`R${r + 1} 합의 판정 중…`);
+      try {
+        const judgeText = await complete({
+          model: models[0],
+          messages: buildJudgeMessages(
+            topic,
+            turns.filter((t) => t.round === r),
+          ),
+          temperature: 0,
+          signal,
+        });
+        consensus = parseVerdict(judgeText) ?? consensus;
+      } catch {
+        // Judge failure is non-fatal — keep debating.
+      }
+      if (consensus?.agreed && consensus.confidence >= CONSENSUS_CONFIDENCE_THRESHOLD) {
+        onToken(`R${r + 1} 합의 (신뢰도 ${consensus.confidence.toFixed(2)}) — 조기 종료`);
+        break;
+      }
     }
   }
 
@@ -129,5 +170,5 @@ export async function runDebate(
   }
 
   const completedRounds = turns.length > 0 ? turns[turns.length - 1].round + 1 : 0;
-  return { status: "done", topic, turns, summary, rounds_completed: completedRounds };
+  return { status: "done", topic, turns, summary, rounds_completed: completedRounds, consensus };
 }
