@@ -11,12 +11,18 @@ type Runtime = typeof import("./src/consilium.runtime.js");
 let _rt: Promise<Runtime> | undefined;
 const rt = (): Promise<Runtime> => (_rt ??= import("./src/consilium.runtime.js"));
 
-type Cfg = { ollamaUrl?: string; defaultModels?: string[]; maxIterations?: number };
+type Cfg = {
+  ollamaUrl?: string;
+  defaultModels?: string[];
+  maxIterations?: number;
+  auditLogPath?: string;
+};
 function cfg(c: Cfg) {
   return {
     ollamaUrl: c.ollamaUrl ?? DEFAULT_OLLAMA_URL,
     models: c.defaultModels ?? DEFAULT_MODELS,
     maxIterations: c.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+    auditLogPath: c.auditLogPath,
   };
 }
 
@@ -39,6 +45,9 @@ export default defineToolPlugin({
       ),
       maxIterations: Type.Optional(
         Type.Integer({ minimum: 1, maximum: 50, description: "goal 루프 기본 최대 반복 횟수" }),
+      ),
+      auditLogPath: Type.Optional(
+        Type.String({ description: "실행 감사 로그 파일 경로 (JSONL). 미지정 시 로깅 비활성." }),
       ),
     },
     { additionalProperties: false },
@@ -117,6 +126,18 @@ export default defineToolPlugin({
         );
 
         if (result.status === "failed") throw new Error(result.error ?? "토론 실패");
+
+        if (c.auditLogPath) {
+          const { appendAuditLog } = await rt();
+          await appendAuditLog(c.auditLogPath, {
+            ts: new Date().toISOString(),
+            tool: "debate",
+            models: params.models ?? c.models,
+            input: params.topic.slice(0, 200),
+            status: result.status,
+            rounds_completed: result.rounds_completed,
+          }).catch(() => {});
+        }
         return result;
       },
     }),
@@ -177,6 +198,19 @@ export default defineToolPlugin({
             }),
           signal,
         );
+
+        if (c.auditLogPath) {
+          const { appendAuditLog } = await rt();
+          await appendAuditLog(c.auditLogPath, {
+            ts: new Date().toISOString(),
+            tool: "goal",
+            models: params.models ?? c.models,
+            input: params.goal.slice(0, 200),
+            status: result.status,
+            iterations: result.iterations,
+            error: result.error,
+          }).catch(() => {});
+        }
 
         if (result.status === "failed") {
           return {
