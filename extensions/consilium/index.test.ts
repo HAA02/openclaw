@@ -36,6 +36,36 @@ describe("debate.runtime", () => {
     expect(result.turns.filter((t) => t.model === "m1").length).toBe(2);
     expect(result.turns.filter((t) => t.model === "m2").length).toBe(2);
   });
+
+  it("early-stops when the judge verdict reports consensus", async () => {
+    const { runDebate } = await import("./src/debate.runtime.js");
+    const complete: CompleteFn = async ({ messages }) =>
+      messages[0]?.content.includes("judge")
+        ? '{"agreed": true, "confidence": 0.9, "reason": "aligned"}'
+        : "my position";
+    const result = await runDebate(
+      complete,
+      { topic: "T", models: ["m1", "m2"], rounds: 5, mode: "debate" },
+      () => {},
+    );
+    expect(result.consensus?.agreed).toBe(true);
+    expect(result.rounds_completed).toBeLessThan(5);
+  });
+
+  it("runs all rounds when the judge reports no consensus", async () => {
+    const { runDebate } = await import("./src/debate.runtime.js");
+    const complete: CompleteFn = async ({ messages }) =>
+      messages[0]?.content.includes("judge")
+        ? '{"agreed": false, "confidence": 0.2, "reason": "diverge"}'
+        : "my position";
+    const result = await runDebate(
+      complete,
+      { topic: "T", models: ["m1", "m2"], rounds: 3, mode: "debate" },
+      () => {},
+    );
+    expect(result.rounds_completed).toBe(3);
+    expect(result.consensus?.agreed).toBe(false);
+  });
 });
 
 describe("goal-loop.runtime (unit)", () => {
