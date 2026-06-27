@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { RunAgentFn, RunCmdFn } from "./src/goal-loop.runtime.js";
 import type { CompleteFn } from "./src/llm.runtime.js";
 
 describe("consilium plugin", () => {
@@ -92,6 +93,83 @@ describe("goal-loop.runtime (unit)", () => {
     );
     expect(result.status).toBe("failed");
     expect(result.iterations).toBe(50);
+  });
+});
+
+describe("goal-loop.runtime (native agent path)", () => {
+  it("calls runAgent and returns done when LLM judge reports achieved", async () => {
+    const { runGoalLoop } = await import("./src/goal-loop.runtime.js");
+    const complete: CompleteFn = async () => '{"achieved": true, "feedback": "goal completed"}';
+    const runAgent: RunAgentFn = async ({ goal }) => ({ output: `Implemented: ${goal}` });
+    const runCmd: RunCmdFn = async () => ({ ok: true, out: "diff summary" });
+    const result = await runGoalLoop(
+      complete,
+      {
+        goal: "Create src/hello.ts",
+        models: ["gpt-oss:20b"],
+        maxIterations: 3,
+        repoPath: "/tmp/test-repo",
+        runAgent,
+        runCmd,
+        agentModel: "gpt-oss:20b",
+      },
+      () => {},
+    );
+    expect(result.status).toBe("done");
+    expect(result.summary).toContain("Create src/hello.ts");
+    expect(result.iterations).toBe(1);
+  });
+
+  it("retries when verifyCmd fails, succeeds on second attempt", async () => {
+    const { runGoalLoop } = await import("./src/goal-loop.runtime.js");
+    const complete: CompleteFn = async () => "";
+    const runAgent: RunAgentFn = async () => ({ output: "done" });
+    let callCount = 0;
+    const runCmd: RunCmdFn = async (cmd) => {
+      if (cmd === "npm test") {
+        callCount++;
+        return callCount >= 2 ? { ok: true, out: "" } : { ok: false, out: "FAIL: test failed" };
+      }
+      return { ok: true, out: "" }; // git diff
+    };
+    const result = await runGoalLoop(
+      complete,
+      {
+        goal: "Fix tests",
+        models: ["gpt-oss:20b"],
+        maxIterations: 5,
+        repoPath: "/tmp/test-repo",
+        verifyCmd: "npm test",
+        runAgent,
+        runCmd,
+        agentModel: "gpt-oss:20b",
+      },
+      () => {},
+    );
+    expect(result.status).toBe("done");
+    expect(result.iterations).toBe(2);
+  });
+
+  it("fails after maxIterations when judge never reports achieved", async () => {
+    const { runGoalLoop } = await import("./src/goal-loop.runtime.js");
+    const complete: CompleteFn = async () => '{"achieved": false, "feedback": "not done yet"}';
+    const runAgent: RunAgentFn = async () => ({ output: "partial" });
+    const runCmd: RunCmdFn = async () => ({ ok: true, out: "" });
+    const result = await runGoalLoop(
+      complete,
+      {
+        goal: "Impossible task",
+        models: ["gpt-oss:20b"],
+        maxIterations: 3,
+        repoPath: "/tmp/test-repo",
+        runAgent,
+        runCmd,
+        agentModel: "gpt-oss:20b",
+      },
+      () => {},
+    );
+    expect(result.status).toBe("failed");
+    expect(result.iterations).toBe(3);
   });
 });
 

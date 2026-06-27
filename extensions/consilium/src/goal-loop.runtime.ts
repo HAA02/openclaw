@@ -1,10 +1,12 @@
-// Goal-driven development loop. Port of Consilium's goal_dev_loop.py.
-// Multi-model roundtable → parse ### FILE: blocks → apply → verify → iterate.
+// Goal-driven development loop.
+// Native path: injected RunAgentFn (tool-calling model, e.g. gpt-oss:20b) edits files;
+// verifyCmd or LLM judge gates completion.
+// Fallback (no runAgent): ### FILE: protocol via CompleteFn — unit tests only.
 
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { CompleteFn } from "./llm.runtime.js";
+import type { CompleteFn, LlmMsg } from "./llm.runtime.js";
 
 export type GoalResult = {
   status: "done" | "failed";
@@ -15,7 +17,25 @@ export type GoalResult = {
   error?: string;
 };
 
-// Parse ### FILE: <path>\n```lang\n...\n``` blocks from model output.
+// Injected dep — production: wraps api.runtime.agent.runEmbeddedAgent.
+// model must be tool-calling capable (e.g. "gpt-oss:20b") so the agent can read/edit/bash.
+export type RunAgentFn = (req: {
+  goal: string;
+  feedback: string;
+  workspaceDir: string;
+  model: string;
+  signal?: AbortSignal;
+}) => Promise<{ output: string }>;
+
+// Injected dep — production: wraps api.runtime.system.runCommandWithTimeout.
+export type RunCmdFn = (
+  cmd: string,
+  cwd: string,
+  signal?: AbortSignal,
+) => Promise<{ ok: boolean; out: string }>;
+
+// ── Fallback helpers (### FILE: protocol — unit tests only) ──────────────
+
 function parseFileBlocks(text: string): Map<string, string> {
   const files = new Map<string, string>();
   const re = /###\s*FILE:\s*([^\n]+)\n```[^\n]*\n([\s\S]*?)```/g;
@@ -35,7 +55,7 @@ async function applyFiles(repoPath: string, files: Map<string, string>): Promise
   }
 }
 
-function runCmd(
+function localRunCmd(
   cmd: string,
   cwd: string,
   signal?: AbortSignal,
@@ -57,12 +77,49 @@ function runCmd(
   });
 }
 
-async function gitDiff(repoPath: string): Promise<string> {
-  const result = await runCmd("git diff HEAD --stat 2>/dev/null || git diff --stat", repoPath);
-  return result.out;
+// ── LLM judge (native path, no verifyCmd) ────────────────────────────────
+
+type JudgeVerdict = { achieved: boolean; feedback: string };
+
+function buildJudgeMessages(goal: string, agentOutput: string, diff: string): LlmMsg[] {
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior code reviewer. Assess whether the agent achieved the goal. " +
+        'Reply ONLY with JSON: {"achieved": boolean, "feedback": string}',
+    },
+    {
+      role: "user",
+      content:
+        `Goal: ${goal}\n\nAgent output:\n${agentOutput.slice(0, 500)}\n\n` +
+        `Git diff summary:\n${diff.slice(0, 800)}\n\n` +
+        "Did the agent fully achieve the goal? If not, what needs to be fixed?",
+    },
+  ];
 }
 
-// Build system prompt with ### FILE: protocol instructions.
+function parseJudgeVerdict(text: string): JudgeVerdict {
+  try {
+    const m = text.match(/\{[\s\S]*?\}/);
+    if (m) {
+      const v = JSON.parse(m[0]) as Partial<JudgeVerdict>;
+      if (typeof v.achieved === "boolean") {
+        return { achieved: v.achieved, feedback: String(v.feedback ?? "") };
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+  const lower = text.toLowerCase();
+  return {
+    achieved: lower.includes('"achieved":true') || lower.includes('"achieved": true'),
+    feedback: text.slice(0, 300),
+  };
+}
+
+// ── Goal prompt helpers (### FILE: fallback) ──────────────────────────────
+
 function goalSystemPrompt(goal: string, feedback: string): string {
   const feedbackBlock = feedback
     ? `\n\nPrevious attempt failed:\n${feedback}\n\nFix the above issues.`
@@ -79,7 +136,6 @@ function goalSystemPrompt(goal: string, feedback: string): string {
   );
 }
 
-// Multi-model roundtable: each model proposes, first model is used as primary.
 async function roundtable(
   complete: CompleteFn,
   models: string[],
@@ -89,35 +145,30 @@ async function roundtable(
   signal?: AbortSignal,
 ): Promise<string> {
   onProgress(`roundtable:${models.join(",")}`);
-
   if (models.length === 1) {
     return complete({
       model: models[0],
       messages: [
         { role: "system", content: goalSystemPrompt(goal, feedback) },
-        { role: "user", content: `Implement the goal now.` },
+        { role: "user", content: "Implement the goal now." },
       ],
       temperature: 0.5,
       signal,
     });
   }
-
-  // Multiple models: each proposes independently, then primary synthesizes
   const proposals = await Promise.all(
     models.map((m) =>
       complete({
         model: m,
         messages: [
           { role: "system", content: goalSystemPrompt(goal, feedback) },
-          { role: "user", content: `Implement the goal now.` },
+          { role: "user", content: "Implement the goal now." },
         ],
         temperature: 0.5,
         signal,
       }).catch((err) => `[${m} failed: ${err instanceof Error ? err.message : String(err)}]`),
     ),
   );
-
-  // Primary model synthesizes: pick the proposal with the most file blocks (best signal)
   let best = proposals[0];
   let bestCount = parseFileBlocks(best).size;
   for (const p of proposals.slice(1)) {
@@ -130,6 +181,8 @@ async function roundtable(
   return best;
 }
 
+// ── Main exported loop ────────────────────────────────────────────────────
+
 export async function runGoalLoop(
   complete: CompleteFn,
   params: {
@@ -138,19 +191,77 @@ export async function runGoalLoop(
     maxIterations: number;
     verifyCmd?: string;
     repoPath?: string;
+    // Native deps (production). Absent = ### FILE: fallback (unit tests).
+    runAgent?: RunAgentFn; // tool-calling embedded agent (gpt-oss:20b)
+    runCmd?: RunCmdFn; // shell runner; falls back to local spawn when absent
+    agentModel?: string; // model for runAgent + judge; defaults to models[0]
   },
   onProgress: (status: string) => void,
   signal?: AbortSignal,
 ): Promise<GoalResult> {
   const { goal, models, verifyCmd, repoPath } = params;
   const maxIter = Math.min(params.maxIterations, 50);
+  const execCmd = params.runCmd ?? localRunCmd;
+  const agentModel = params.agentModel ?? models[0] ?? "gpt-oss:20b";
   let feedback = "";
 
   for (let i = 0; i < maxIter; i++) {
     if (signal?.aborted) throw new Error("Aborted");
     onProgress(`iteration:${i + 1}/${maxIter}`);
 
-    // Generate files via roundtable
+    // ── Native embedded agent path ─────────────────────────────────────
+    if (params.runAgent && repoPath) {
+      onProgress(`agent:${agentModel}`);
+      let agentOutput: string;
+      try {
+        const res = await params.runAgent({
+          goal,
+          feedback,
+          workspaceDir: repoPath,
+          model: agentModel,
+          signal,
+        });
+        agentOutput = res.output;
+      } catch (err) {
+        return { status: "failed", goal, iterations: i + 1, summary: "", error: String(err) };
+      }
+
+      if (verifyCmd) {
+        onProgress(`verifying:${verifyCmd}`);
+        const vr = await execCmd(verifyCmd, repoPath, signal);
+        if (vr.ok) {
+          const dr = await execCmd("git diff HEAD --stat", repoPath, signal);
+          return { status: "done", goal, iterations: i + 1, summary: agentOutput, diff: dr.out };
+        }
+        feedback = vr.out;
+        onProgress(`verify-failed:${feedback.slice(0, 80)}`);
+        continue;
+      }
+
+      // No verifyCmd: LLM judge using agentModel (gpt-oss:20b)
+      onProgress("judge:assessing");
+      const dr = await execCmd("git diff HEAD --stat", repoPath, signal);
+      let verdict: JudgeVerdict;
+      try {
+        const jt = await complete({
+          model: agentModel,
+          messages: buildJudgeMessages(goal, agentOutput, dr.out),
+          temperature: 0.1,
+          signal,
+        });
+        verdict = parseJudgeVerdict(jt);
+      } catch {
+        verdict = { achieved: false, feedback: "Judge unavailable — retrying." };
+      }
+      if (verdict.achieved) {
+        return { status: "done", goal, iterations: i + 1, summary: agentOutput, diff: dr.out };
+      }
+      feedback = verdict.feedback;
+      onProgress(`judge-not-achieved:${feedback.slice(0, 80)}`);
+      continue;
+    }
+
+    // ── ### FILE: fallback (unit tests / generate-only) ──────────────
     let response: string;
     try {
       response = await roundtable(complete, models, goal, feedback, onProgress, signal);
@@ -159,7 +270,6 @@ export async function runGoalLoop(
     }
 
     const files = parseFileBlocks(response);
-
     if (files.size === 0) {
       feedback = "파일 블록이 없습니다. ### FILE: <path>\\n```lang\\n...\\n``` 형식을 사용하세요.";
       onProgress(`no-files:iteration ${i + 1}`);
@@ -175,39 +285,38 @@ export async function runGoalLoop(
         feedback = `파일 적용 실패: ${String(err)}`;
         continue;
       }
-
       if (verifyCmd) {
         onProgress(`verifying:${verifyCmd}`);
-        const result = await runCmd(verifyCmd, repoPath, signal);
-        if (result.ok) {
+        const vr = await execCmd(verifyCmd, repoPath, signal);
+        if (vr.ok) {
+          const dr = await execCmd("git diff HEAD --stat", repoPath, signal);
           return {
             status: "done",
             goal,
             iterations: i + 1,
             summary: `${i + 1}번 반복 후 완료. ${files.size}개 파일 적용.`,
-            diff: await gitDiff(repoPath),
+            diff: dr.out,
           };
         }
-        feedback = result.out;
+        feedback = vr.out;
         onProgress(`verify-failed:${feedback.slice(0, 80)}`);
       } else {
+        const dr = await execCmd("git diff HEAD --stat", repoPath, signal);
         return {
           status: "done",
           goal,
           iterations: i + 1,
           summary: `${files.size}개 파일을 ${repoPath}에 적용.`,
-          diff: await gitDiff(repoPath),
+          diff: dr.out,
         };
       }
     } else {
-      // No repo — return generated content as summary
-      const listing = Array.from(files.keys()).join(", ");
       return {
         status: "done",
         goal,
         iterations: i + 1,
         summary: response,
-        diff: `생성된 파일: ${listing}`,
+        diff: `생성된 파일: ${Array.from(files.keys()).join(", ")}`,
       };
     }
   }

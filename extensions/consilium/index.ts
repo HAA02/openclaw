@@ -9,10 +9,14 @@
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { Type } from "typebox";
 import type { AuditEntry } from "./src/audit.runtime.js";
+import type { RunAgentFn, RunCmdFn } from "./src/goal-loop.runtime.js";
 import type { CompleteFn } from "./src/llm.runtime.js";
 
 const DEFAULT_MODELS = ["llama3.2"];
 const DEFAULT_MAX_ITERATIONS = 10;
+// Tool-calling model for the embedded goal agent (writes/edits files via tools).
+// gpt-oss:20b supports tool calling and is used for both implementation and judge verdict.
+const GOAL_AGENT_MODEL = "gpt-oss:20b";
 const AUDIT_NS = "consilium-audit";
 const AUDIT_MAX_ENTRIES = 1000;
 
@@ -64,6 +68,54 @@ function buildComplete(
       purpose,
     } as never);
     return res.text;
+  };
+}
+
+// Adapt api.runtime.agent.runEmbeddedAgent into RunAgentFn.
+// The embedded agent receives goal + feedback as a prompt and uses tools (read/edit/bash)
+// to implement changes directly in the workspaceDir.
+function buildRunAgent(
+  agentRuntime: { runEmbeddedAgent: (p: never) => Promise<{ payloads: unknown[] }> },
+  sessionId: string,
+): RunAgentFn {
+  return async ({ goal, feedback, workspaceDir, model, signal }) => {
+    const prompt =
+      `Goal: ${goal}` +
+      (feedback
+        ? `\n\nPrevious attempt (not passing):\n${feedback}\n\nPlease fix the issues.`
+        : "");
+    const result = await agentRuntime.runEmbeddedAgent({
+      provider: "ollama",
+      model,
+      workspaceDir,
+      prompt,
+      toolsAllow: ["read", "edit", "write", "bash"],
+      sessionId,
+      timeoutMs: 300_000,
+      signal,
+    } as never);
+    const output = (result.payloads as Array<{ text?: string }>)
+      .flatMap((p) => (p.text ? [p.text] : []))
+      .join("\n");
+    return { output };
+  };
+}
+
+// Adapt api.runtime.system.runCommandWithTimeout into RunCmdFn.
+function buildRunCmd(system: {
+  runCommandWithTimeout: (
+    argv: string[],
+    opts: { timeoutMs: number; cwd?: string; signal?: AbortSignal },
+  ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+}): RunCmdFn {
+  return async (cmd, cwd, signal) => {
+    const result = await system.runCommandWithTimeout(["sh", "-c", cmd], {
+      timeoutMs: 60_000,
+      cwd,
+      signal,
+    } as never);
+    const out = ((result.stdout ?? "") + (result.stderr ?? "")).slice(-1500);
+    return { ok: result.code === 0, out };
   };
 }
 
@@ -192,9 +244,19 @@ export default defineToolPlugin({
         { additionalProperties: false },
       ),
       execute: async (params, config, { signal, onUpdate, api, toolCallId }) => {
+        // Fail-closed pre-call scan: reject goals with prompt injection patterns.
+        // Full before_tool_call hook (intercepts embedded agent tool calls) is Crabbox-gated.
+        const injectionRe =
+          /ignore\s+(all\s+)?previous\s+(instructions|prompts)|jailbreak|override\s+(system|safety)|act\s+as\s+if\s+you\s+have\s+no\s+(restrictions|limits)/i;
+        if (injectionRe.test(params.goal)) {
+          throw new Error("보안 차단: goal에서 프롬프트 인젝션 패턴 감지됨.");
+        }
+
         const c = cfg(config);
         const { runGoalLoop } = await rt();
         const complete = buildComplete(api.runtime.llm, "consilium-goal");
+        const runAgent = buildRunAgent(api.runtime.agent as never, toolCallId);
+        const runCmd = buildRunCmd(api.runtime.system as never);
 
         const result = await runGoalLoop(
           complete,
@@ -204,6 +266,9 @@ export default defineToolPlugin({
             maxIterations: params.max_iterations,
             verifyCmd: params.verify_cmd,
             repoPath: params.repo_path,
+            runAgent,
+            runCmd,
+            agentModel: GOAL_AGENT_MODEL,
           },
           (status) =>
             onUpdate?.({
