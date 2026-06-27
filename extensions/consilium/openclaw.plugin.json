@@ -5,6 +5,9 @@
     "onStartup": true
   },
   "enabledByDefault": false,
+  "contracts": {
+    "tools": ["consilium_debate", "consilium_goal"]
+  },
   "tools": [
     {
       "name": "consilium_debate",

@@ -2,6 +2,9 @@
   "id": "security-guard",
   "activation": { "onStartup": true },
   "enabledByDefault": false,
+  "contracts": {
+    "tools": ["security_check"]
+  },
   "tools": [
     { "name": "security_check", "optional": true }
   ],
