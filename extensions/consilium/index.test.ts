@@ -96,10 +96,21 @@ describe("goal-loop.runtime (unit)", () => {
 });
 
 describe("audit.runtime", () => {
-  it("appendAuditLog writes JSONL entry to temp path", async () => {
-    const { appendAuditLog } = await import("./src/audit.runtime.js");
-    const tmpPath = `/tmp/consilium-audit-test-${Date.now()}.jsonl`;
-    await appendAuditLog(tmpPath, {
+  // In-memory stand-in for the host SQLite keyed store (structural AuditSink).
+  function fakeSink() {
+    const rows = new Map<string, unknown>();
+    return {
+      rows,
+      register: async (key: string, value: unknown) => {
+        rows.set(key, value);
+      },
+    };
+  }
+
+  it("recordAudit writes an entry keyed by the given key", async () => {
+    const { recordAudit } = await import("./src/audit.runtime.js");
+    const sink = fakeSink();
+    await recordAudit(sink, "call-1", {
       ts: "2026-06-27T00:00:00.000Z",
       tool: "goal",
       models: ["llama3.2"],
@@ -107,41 +118,24 @@ describe("audit.runtime", () => {
       status: "done",
       iterations: 2,
     });
-    const { readFile } = await import("node:fs/promises");
-    const content = await readFile(tmpPath, "utf8");
-    const entry = JSON.parse(content.trim());
+    const entry = sink.rows.get("call-1") as { tool: string; iterations: number; status: string };
     expect(entry.tool).toBe("goal");
     expect(entry.iterations).toBe(2);
     expect(entry.status).toBe("done");
-    const { unlink } = await import("node:fs/promises");
-    await unlink(tmpPath).catch(() => {});
   });
 
-  it("appendAuditLog appends multiple entries", async () => {
-    const { appendAuditLog } = await import("./src/audit.runtime.js");
-    const tmpPath = `/tmp/consilium-audit-multi-${Date.now()}.jsonl`;
-    await appendAuditLog(tmpPath, {
-      ts: "t1",
-      tool: "debate",
-      models: ["m1"],
-      input: "a",
-      status: "done",
-      rounds_completed: 1,
-    });
-    await appendAuditLog(tmpPath, {
-      ts: "t2",
-      tool: "goal",
-      models: ["m1"],
-      input: "b",
-      status: "failed",
-      iterations: 5,
-    });
-    const { readFile } = await import("node:fs/promises");
-    const lines = (await readFile(tmpPath, "utf8")).trim().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(JSON.parse(lines[0]).tool).toBe("debate");
-    expect(JSON.parse(lines[1]).status).toBe("failed");
-    const { unlink } = await import("node:fs/promises");
-    await unlink(tmpPath).catch(() => {});
+  it("recordAudit swallows sink errors so it never breaks a tool call", async () => {
+    const { recordAudit } = await import("./src/audit.runtime.js");
+    const failing = { register: async () => Promise.reject(new Error("store down")) };
+    await expect(
+      recordAudit(failing, "k", {
+        ts: "t",
+        tool: "debate",
+        models: ["m1"],
+        input: "a",
+        status: "done",
+        rounds_completed: 1,
+      }),
+    ).resolves.toBeUndefined();
   });
 });
