@@ -1,0 +1,18 @@
+{
+  "name": "@openclaw/consilium",
+  "version": "2026.6.27",
+  "private": true,
+  "description": "Consilium — native multi-model debate and goal-driven dev loop for OpenClaw.",
+  "type": "module",
+  "dependencies": {
+    "typebox": "1.1.39"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

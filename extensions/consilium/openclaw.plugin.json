@@ -1,0 +1,57 @@
+{
+  "id": "consilium",
+  "icon": "https://cdn.simpleicons.org/ollama",
+  "activation": {
+    "onStartup": true
+  },
+  "enabledByDefault": false,
+  "tools": [
+    {
+      "name": "consilium_health",
+      "optional": true
+    },
+    {
+      "name": "consilium_debate",
+      "optional": true
+    },
+    {
+      "name": "consilium_goal",
+      "optional": true
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "ollamaUrl": {
+        "type": "string",
+        "description": "Ollama API URL (기본값: http://127.0.0.1:11434)"
+      },
+      "defaultModels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "기본 모델 목록 (예: [\"llama3.2\", \"qwen2.5-coder\"])"
+      },
+      "maxIterations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "description": "goal 루프 기본 최대 반복 횟수"
+      }
+    }
+  },
+  "uiHints": {
+    "ollamaUrl": {
+      "label": "Ollama URL",
+      "help": "로컬 Ollama 서버 주소. 기본값: http://127.0.0.1:11434"
+    },
+    "defaultModels": {
+      "label": "기본 모델",
+      "help": "토론/goal에 사용할 Ollama 모델 목록."
+    },
+    "maxIterations": {
+      "label": "최대 반복",
+      "help": "goal 루프 기본 최대 반복 횟수 (1–50)."
+    }
+  }
+}
