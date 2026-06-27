@@ -1,0 +1,24 @@
+{
+  "id": "security-guard",
+  "activation": { "onStartup": true },
+  "enabledByDefault": false,
+  "tools": [
+    { "name": "security_check", "optional": true }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "strict": {
+        "type": "boolean",
+        "description": "true(기본값): critical+high 차단. false: critical만 차단."
+      }
+    }
+  },
+  "uiHints": {
+    "strict": {
+      "label": "엄격 모드",
+      "help": "활성화 시 high 등급 위협(쉘 인젝션, 경로 탐색)도 차단합니다."
+    }
+  }
+}

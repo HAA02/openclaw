@@ -1,0 +1,8 @@
+{
+  "branch": "AutoPM-260627",
+  "started_at": "2026-06-27",
+  "verify_cmd": "node scripts/run-vitest.mjs extensions/consilium/index.test.ts extensions/security-guard/index.test.ts",
+  "gate_max_consecutive_blocks": 8,
+  "goals": ["[C] 보안 가드", "[D] 감사 로그"],
+  "decisions": []
+}

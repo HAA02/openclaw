@@ -107,6 +107,58 @@ describe("goal-loop.runtime (unit)", () => {
   });
 });
 
+describe("audit.runtime", () => {
+  it("appendAuditLog writes JSONL entry to temp path", async () => {
+    const { appendAuditLog } = await import("./src/audit.runtime.js");
+    const tmpPath = `/tmp/consilium-audit-test-${Date.now()}.jsonl`;
+    await appendAuditLog(tmpPath, {
+      ts: "2026-06-27T00:00:00.000Z",
+      tool: "goal",
+      models: ["llama3.2"],
+      input: "test goal",
+      status: "done",
+      iterations: 2,
+    });
+    const { readFile } = await import("node:fs/promises");
+    const content = await readFile(tmpPath, "utf8");
+    const entry = JSON.parse(content.trim());
+    expect(entry.tool).toBe("goal");
+    expect(entry.iterations).toBe(2);
+    expect(entry.status).toBe("done");
+    // cleanup
+    const { unlink } = await import("node:fs/promises");
+    await unlink(tmpPath).catch(() => {});
+  });
+
+  it("appendAuditLog appends multiple entries", async () => {
+    const { appendAuditLog } = await import("./src/audit.runtime.js");
+    const tmpPath = `/tmp/consilium-audit-multi-${Date.now()}.jsonl`;
+    await appendAuditLog(tmpPath, {
+      ts: "t1",
+      tool: "debate",
+      models: ["m1"],
+      input: "a",
+      status: "done",
+      rounds_completed: 1,
+    });
+    await appendAuditLog(tmpPath, {
+      ts: "t2",
+      tool: "goal",
+      models: ["m1"],
+      input: "b",
+      status: "failed",
+      iterations: 5,
+    });
+    const { readFile } = await import("node:fs/promises");
+    const lines = (await readFile(tmpPath, "utf8")).trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]).tool).toBe("debate");
+    expect(JSON.parse(lines[1]).status).toBe("failed");
+    const { unlink } = await import("node:fs/promises");
+    await unlink(tmpPath).catch(() => {});
+  });
+});
+
 // Live tests — requires Ollama at :11434
 const LIVE = process.env.CONSILIUM_LIVE_TEST === "1";
 
