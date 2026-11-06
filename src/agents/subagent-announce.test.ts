@@ -40,7 +40,11 @@ let mockConfig: ReturnType<(typeof import("../config/config.js"))["getRuntimeCon
   },
 };
 
-const { subagentRegistryRuntimeMock } = vi.hoisted(() => ({
+const { resolveSubagentCompletionOriginMock, subagentRegistryRuntimeMock } = vi.hoisted(() => ({
+  resolveSubagentCompletionOriginMock: vi.fn(
+    async (params: { requesterOrigin?: unknown; hooksOnly?: boolean }) =>
+      params.hooksOnly === true ? undefined : params.requesterOrigin,
+  ),
   subagentRegistryRuntimeMock: {
     shouldIgnorePostCompletionAnnounceForSession: vi.fn(() => false),
     isSubagentSessionRunActive: vi.fn(() => true),
@@ -101,6 +105,7 @@ vi.mock("./subagent-announce-delivery.js", () => ({
       accountId?: string;
       threadId?: string;
     };
+    completionDirectOriginExplicit?: boolean;
     directOrigin?: { channel?: string; to?: string; accountId?: string; threadId?: string };
     requesterSessionOrigin?: { provider?: string; channel?: string };
     bestEffortDeliver?: boolean;
@@ -129,25 +134,35 @@ vi.mock("./subagent-announce-delivery.js", () => ({
 
     const effectiveOrigin =
       params.completionDirectOrigin ?? params.requesterOrigin ?? params.directOrigin;
+    const shouldDeliverExternally =
+      (!params.requesterIsSubagent || params.completionDirectOriginExplicit === true) &&
+      effectiveOrigin?.channel !== "webchat" &&
+      Boolean(effectiveOrigin?.channel && effectiveOrigin?.to);
+    const sessionOnlyOrigin =
+      !params.requesterIsSubagent && effectiveOrigin?.channel === "webchat"
+        ? {
+            channel: effectiveOrigin.channel,
+            to: effectiveOrigin.to,
+            accountId: effectiveOrigin.accountId,
+            threadId: effectiveOrigin.threadId,
+          }
+        : {};
 
     const response = (await callGatewayMock({
       method: "agent",
       params: {
         sessionKey: params.targetRequesterSessionKey,
         message: params.triggerMessage,
-        deliver:
-          !params.requesterIsSubagent &&
-          effectiveOrigin?.channel !== "webchat" &&
-          Boolean(effectiveOrigin?.channel && effectiveOrigin?.to),
+        deliver: shouldDeliverExternally,
         bestEffortDeliver: params.bestEffortDeliver,
-        ...(params.requesterIsSubagent
-          ? {}
-          : {
+        ...(shouldDeliverExternally
+          ? {
               channel: effectiveOrigin?.channel,
               to: effectiveOrigin?.to,
               accountId: effectiveOrigin?.accountId,
               threadId: effectiveOrigin?.threadId,
-            }),
+            }
+          : sessionOnlyOrigin),
       },
     })) as { status?: string; error?: string };
 
@@ -187,8 +202,8 @@ vi.mock("./subagent-announce-delivery.js", () => ({
     accountId: requesterOrigin?.accountId ?? entry?.lastAccountId ?? entry?.origin?.accountId,
     threadId: requesterOrigin?.threadId ?? entry?.lastThreadId,
   }),
-  resolveSubagentCompletionOrigin: async (params: { requesterOrigin?: unknown }) =>
-    params.requesterOrigin,
+  resolveSubagentCompletionOrigin: (params: { requesterOrigin?: unknown }) =>
+    resolveSubagentCompletionOriginMock(params),
   resolveSubagentAnnounceTimeoutMs: () => 10_000,
   runAnnounceDeliveryWithRetry: async <T>(params: { run: () => Promise<T> }) => await params.run(),
 }));
@@ -299,6 +314,11 @@ describe("subagent announce seam flow", () => {
     subagentRegistryRuntimeMock.replaceSubagentRunAfterSteer.mockReturnValue(true);
     subagentRegistryRuntimeMock.resolveRequesterForChildSession.mockReset();
     subagentRegistryRuntimeMock.resolveRequesterForChildSession.mockReturnValue(null);
+    resolveSubagentCompletionOriginMock.mockReset();
+    resolveSubagentCompletionOriginMock.mockImplementation(
+      async (params: { requesterOrigin?: unknown; hooksOnly?: boolean }) =>
+        params.hooksOnly === true ? undefined : params.requesterOrigin,
+    );
   });
 
   it("suppresses ANNOUNCE_SKIP delivery while still deleting the child session", async () => {
@@ -362,6 +382,55 @@ describe("subagent announce seam flow", () => {
     });
   });
 
+  it("consults fixed completion hooks for nested role subagent completions without losing PM handoff", async () => {
+    resolveSubagentCompletionOriginMock.mockResolvedValueOnce({
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:1507284410699874384",
+    });
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:backend:subagent:child",
+      childRunId: "run-backend-role",
+      requesterSessionKey: "agent:pm:subagent:parent",
+      requesterOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      requesterDisplayKey: "pm",
+      task: "backend work",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "backend complete",
+      spawnMode: "session",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(resolveSubagentCompletionOriginMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childSessionKey: "agent:backend:subagent:child",
+        requesterSessionKey: "agent:pm:subagent:parent",
+        hooksOnly: true,
+      }),
+    );
+    const agentCall = requireAgentCall();
+    expect(agentCall.params).toEqual(
+      expect.objectContaining({
+        sessionKey: "agent:pm:subagent:parent",
+        deliver: true,
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:1507284410699874384",
+      }),
+    );
+  });
+
   it("uses origin.provider for channel-specific queue settings in active announce delivery", async () => {
     mockConfig = {
       session: {
@@ -415,6 +484,12 @@ describe("subagent announce seam flow", () => {
   });
 
   it("keeps completion direct announce session-only when requester origin is webchat", async () => {
+    resolveSubagentCompletionOriginMock.mockResolvedValueOnce({
+      channel: "webchat",
+      to: "chat:123",
+      accountId: "default",
+    });
+
     const didAnnounce = await runSubagentAnnounceFlow({
       childSessionKey: "agent:main:subagent:webchat",
       childRunId: "run-webchat-direct-announce",

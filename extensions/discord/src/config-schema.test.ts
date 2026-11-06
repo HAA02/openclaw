@@ -91,6 +91,29 @@ describe("discord config schema", () => {
     expect(cfg.accounts?.noisy?.suppressEmbeds).toBe(false);
   });
 
+  it("accepts subagent channel routes at top-level and account scope", () => {
+    const cfg = expectValidDiscordConfig({
+      subagentChannels: {
+        agents: {
+          pm: "1507284409391513741",
+        },
+      },
+      accounts: {
+        work: {
+          subagentChannels: {
+            enabled: true,
+            agents: {
+              frontend: "1507284411908100156",
+            },
+          },
+        },
+      },
+    });
+
+    expect(cfg.subagentChannels?.agents?.pm).toBe("1507284409391513741");
+    expect(cfg.accounts?.work?.subagentChannels?.agents?.frontend).toBe("1507284411908100156");
+  });
+
   it("rejects unknown preview config keys", () => {
     const issues = expectInvalidDiscordConfig({
       streaming: {

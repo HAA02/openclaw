@@ -6,6 +6,11 @@ import {
   testing as sessionBindingServiceTesting,
   registerSessionBindingAdapter,
 } from "../infra/outbound/session-binding-service.js";
+import {
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "../plugins/hook-runner-global.js";
+import type { PluginHookRegistration } from "../plugins/hook-types.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import type {
@@ -22,12 +27,14 @@ import {
 import {
   callGateway as runtimeCallGateway,
   dispatchGatewayMethodInProcess as runtimeDispatchGatewayMethodInProcess,
+  getGlobalHookRunner as runtimeGetGlobalHookRunner,
   sendMessage as runtimeSendMessage,
 } from "./subagent-announce-delivery.runtime.js";
 import { resolveAnnounceOrigin } from "./subagent-announce-origin.js";
 
 afterEach(() => {
   sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
+  resetGlobalHookRunner();
   setActivePluginRegistry(createTestRegistry());
   testing.setDepsForTest();
 });
@@ -38,6 +45,13 @@ const slackThreadOrigin = {
   accountId: "acct-1",
   threadId: "171.222",
 } as const;
+
+type TestDeliveryOrigin = {
+  channel: string;
+  to: string;
+  accountId?: string;
+  threadId?: string | number;
+};
 
 function createGatewayMock(response: Record<string, unknown> = {}) {
   return vi.fn(async () => response) as unknown as typeof runtimeCallGateway;
@@ -55,6 +69,23 @@ function createSendMessageMock() {
     mediaUrl: null,
     result: { messageId: "msg-1" },
   })) as unknown as typeof runtimeSendMessage;
+}
+
+function createSubagentDeliveryHookRunner(origin: TestDeliveryOrigin | undefined) {
+  const handler = vi.fn(async () => (origin ? { origin } : undefined));
+  initializeGlobalHookRunner({
+    ...createTestRegistry(),
+    plugins: [{ id: "test-subagent-delivery", status: "loaded" }],
+    typedHooks: [
+      {
+        pluginId: "test-subagent-delivery",
+        hookName: "subagent_delivery_target",
+        handler: handler as PluginHookRegistration<"subagent_delivery_target">["handler"],
+        source: "test",
+      },
+    ],
+  });
+  return handler;
 }
 
 type QueueEmbeddedAgentMessageWithOutcome = (
@@ -190,6 +221,10 @@ async function deliverSlackThreadAnnouncement(params: {
   internalEvents?: AgentInternalEvent[];
   sourceTool?: string;
   requesterAbandoned?: boolean;
+  requesterOrigin?: TestDeliveryOrigin;
+  requesterSessionOrigin?: TestDeliveryOrigin;
+  completionDirectOrigin?: TestDeliveryOrigin;
+  directOrigin?: TestDeliveryOrigin;
 }) {
   // Slack thread delivery exercises all origins because direct, session, and
   // completion routing can differ after a child run outlives its requester.
@@ -212,10 +247,10 @@ async function deliverSlackThreadAnnouncement(params: {
     targetRequesterSessionKey: "agent:main:slack:channel:C123:thread:171.222",
     triggerMessage: "child done",
     steerMessage: "child done",
-    requesterOrigin: slackThreadOrigin,
-    requesterSessionOrigin: slackThreadOrigin,
-    completionDirectOrigin: slackThreadOrigin,
-    directOrigin: slackThreadOrigin,
+    requesterOrigin: params.requesterOrigin ?? slackThreadOrigin,
+    requesterSessionOrigin: params.requesterSessionOrigin ?? slackThreadOrigin,
+    completionDirectOrigin: params.completionDirectOrigin ?? slackThreadOrigin,
+    directOrigin: params.directOrigin ?? slackThreadOrigin,
     requesterIsSubagent: false,
     expectsCompletionMessage: params.expectsCompletionMessage,
     bestEffortDeliver: true,
@@ -456,6 +491,164 @@ describe("resolveAnnounceOrigin threaded route targets", () => {
 });
 
 describe("resolveSubagentCompletionOrigin", () => {
+  it("lets an explicit hook completion origin override bound child subagent routes", async () => {
+    registerSessionBindingAdapter({
+      channel: "discord",
+      accountId: "acct-1",
+      listBySession: (targetSessionKey: string) => {
+        if (targetSessionKey === "agent:pm:subagent:child") {
+          return [
+            {
+              bindingId: "discord:acct-1:child-thread",
+              targetSessionKey,
+              targetKind: "subagent",
+              conversation: {
+                channel: "discord",
+                accountId: "acct-1",
+                conversationId: "child-thread",
+              },
+              status: "active",
+              boundAt: 1,
+            },
+          ];
+        }
+        return [];
+      },
+      resolveByConversation: () => null,
+    });
+    const hookHandler = createSubagentDeliveryHookRunner({
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:1507284409391513741",
+    });
+    expect(runtimeGetGlobalHookRunner()?.hasHooks("subagent_delivery_target")).toBe(true);
+
+    const origin = await resolveSubagentCompletionOrigin({
+      childSessionKey: "agent:pm:subagent:child",
+      requesterSessionKey: "agent:cto:main",
+      requesterOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:cto",
+        threadId: "cto-thread",
+      },
+      spawnMode: "session",
+      expectsCompletionMessage: true,
+    });
+
+    expect(hookHandler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childSessionKey: "agent:pm:subagent:child",
+        requesterSessionKey: "agent:cto:main",
+        expectsCompletionMessage: true,
+      }),
+      expect.objectContaining({
+        childSessionKey: "agent:pm:subagent:child",
+        requesterSessionKey: "agent:cto:main",
+      }),
+    );
+    expect(origin).toEqual({
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:1507284409391513741",
+    });
+  });
+
+  it("keeps bound child routing when the hook has no explicit completion origin", async () => {
+    registerSessionBindingAdapter({
+      channel: "discord",
+      accountId: "acct-1",
+      listBySession: (targetSessionKey: string) => {
+        if (targetSessionKey === "agent:pm:subagent:child") {
+          return [
+            {
+              bindingId: "discord:acct-1:child-thread",
+              targetSessionKey,
+              targetKind: "subagent",
+              conversation: {
+                channel: "discord",
+                accountId: "acct-1",
+                conversationId: "child-thread",
+              },
+              status: "active",
+              boundAt: 1,
+            },
+          ];
+        }
+        return [];
+      },
+      resolveByConversation: () => null,
+    });
+    createSubagentDeliveryHookRunner(undefined);
+
+    const origin = await resolveSubagentCompletionOrigin({
+      childSessionKey: "agent:pm:subagent:child",
+      requesterSessionKey: "agent:cto:main",
+      requesterOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:cto",
+      },
+      spawnMode: "session",
+      expectsCompletionMessage: true,
+    });
+
+    expect(origin).toEqual({
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:child-thread",
+    });
+  });
+
+  it("keeps bound child routing when the hook returns an internal origin", async () => {
+    registerSessionBindingAdapter({
+      channel: "discord",
+      accountId: "acct-1",
+      listBySession: (targetSessionKey: string) => {
+        if (targetSessionKey === "agent:pm:subagent:child") {
+          return [
+            {
+              bindingId: "discord:acct-1:child-thread",
+              targetSessionKey,
+              targetKind: "subagent",
+              conversation: {
+                channel: "discord",
+                accountId: "acct-1",
+                conversationId: "child-thread",
+              },
+              status: "active",
+              boundAt: 1,
+            },
+          ];
+        }
+        return [];
+      },
+      resolveByConversation: () => null,
+    });
+    createSubagentDeliveryHookRunner({
+      channel: "webchat",
+      to: "session:parent",
+    });
+
+    const origin = await resolveSubagentCompletionOrigin({
+      childSessionKey: "agent:pm:subagent:child",
+      requesterSessionKey: "agent:cto:main",
+      requesterOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:cto",
+      },
+      spawnMode: "session",
+      expectsCompletionMessage: true,
+    });
+
+    expect(origin).toEqual({
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:child-thread",
+    });
+  });
+
   it("resolves bound completion delivery from the requester session, not the child session", async () => {
     registerSessionBindingAdapter({
       channel: "discord",
@@ -1175,6 +1368,308 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       bestEffortDeliver: true,
     });
     expect(queueEmbeddedAgentMessageWithOutcome).not.toHaveBeenCalled();
+  });
+
+  it("copies generated completion reports back to the requester when a hook routes primary delivery elsewhere", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "PM final report: all role results are verified." }],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+    const queueEmbeddedAgentMessageWithOutcome = createQueueOutcomeMock(false);
+    const requesterOrigin = {
+      channel: "slack",
+      to: "channel:CTO",
+      accountId: "acct-1",
+      threadId: "root-thread",
+    };
+    const roleCompletionOrigin = {
+      channel: "slack",
+      to: "channel:PM",
+      accountId: "acct-1",
+    };
+
+    const result = await deliverSlackThreadAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-roles",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-role-final",
+      queueEmbeddedAgentMessageWithOutcome,
+      requesterOrigin,
+      requesterSessionOrigin: requesterOrigin,
+      directOrigin: requesterOrigin,
+      completionDirectOrigin: roleCompletionOrigin,
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expectGatewayAgentParams(callGateway, {
+      deliver: true,
+      channel: "slack",
+      accountId: "acct-1",
+      to: "channel:PM",
+      threadId: undefined,
+      bestEffortDeliver: true,
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "slack",
+        accountId: "acct-1",
+        to: "channel:CTO",
+        threadId: "root-thread",
+        content: "PM final report: all role results are verified.",
+        payloads: [{ text: "PM final report: all role results are verified." }],
+        idempotencyKey: "announce-role-final:requester-copy",
+      }),
+    );
+  });
+
+  it("delivers nested subagent completions to an explicit role channel without changing the parent session handoff", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "Backend result received by PM." }],
+      },
+    });
+    testing.setDepsForTest({
+      callGateway,
+      getRequesterSessionActivity: () => ({
+        sessionId: "pm-subagent-session",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:pm:subagent:parent",
+      targetRequesterSessionKey: "agent:pm:subagent:parent",
+      triggerMessage: "backend child done",
+      steerMessage: "backend child done",
+      requesterSessionOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      directOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      completionDirectOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:1507284410699874384",
+      },
+      completionDirectOriginExplicit: true,
+      requesterIsSubagent: true,
+      expectsCompletionMessage: true,
+      bestEffortDeliver: true,
+      directIdempotencyKey: "announce-nested-role",
+      sourceSessionKey: "agent:backend:subagent:child",
+      sourceChannel: "internal",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expectGatewayAgentParams(callGateway, {
+      sessionKey: "agent:pm:subagent:parent",
+      message: "backend child done",
+      deliver: true,
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:1507284410699874384",
+      threadId: undefined,
+      bestEffortDeliver: true,
+    });
+  });
+
+  it("keeps nested subagent completions internal when no explicit role channel is present", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "Internal PM update only." }],
+      },
+    });
+    testing.setDepsForTest({
+      callGateway,
+      getRequesterSessionActivity: () => ({
+        sessionId: "pm-subagent-session",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:pm:subagent:parent",
+      targetRequesterSessionKey: "agent:pm:subagent:parent",
+      triggerMessage: "backend child done",
+      steerMessage: "backend child done",
+      requesterSessionOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      directOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      completionDirectOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      requesterIsSubagent: true,
+      expectsCompletionMessage: true,
+      bestEffortDeliver: true,
+      directIdempotencyKey: "announce-nested-internal",
+      sourceSessionKey: "agent:backend:subagent:child",
+      sourceChannel: "internal",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expectGatewayAgentParams(callGateway, {
+      sessionKey: "agent:pm:subagent:parent",
+      message: "backend child done",
+      deliver: false,
+      channel: undefined,
+      to: undefined,
+      bestEffortDeliver: true,
+    });
+  });
+
+  it("keeps the active parent handoff and delivers explicit nested completions to the role channel", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "Backend result received by PM." }],
+      },
+    });
+    const queueEmbeddedAgentMessageWithOutcome = createQueueOutcomeMock(true);
+    testing.setDepsForTest({
+      callGateway,
+      queueEmbeddedAgentMessageWithOutcome,
+      getRequesterSessionActivity: () => ({
+        sessionId: "pm-subagent-session",
+        isActive: true,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:pm:subagent:parent",
+      targetRequesterSessionKey: "agent:pm:subagent:parent",
+      triggerMessage: "backend child done",
+      steerMessage: "backend child done",
+      requesterSessionOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      directOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      completionDirectOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:1507284410699874384",
+      },
+      completionDirectOriginExplicit: true,
+      requesterIsSubagent: true,
+      expectsCompletionMessage: true,
+      bestEffortDeliver: true,
+      directIdempotencyKey: "announce-active-nested-role",
+      sourceSessionKey: "agent:backend:subagent:child",
+      sourceChannel: "internal",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(queueEmbeddedAgentMessageWithOutcome).toHaveBeenCalledWith(
+      "pm-subagent-session",
+      "backend child done",
+      expect.objectContaining({
+        steeringMode: "all",
+        waitForTranscriptCommit: true,
+        deliveryTimeoutMs: 120_000,
+      }),
+    );
+    expectGatewayAgentParams(callGateway, {
+      sessionKey: "agent:pm:subagent:parent",
+      message: "backend child done",
+      deliver: true,
+      channel: "discord",
+      accountId: "acct-1",
+      to: "channel:1507284410699874384",
+      threadId: undefined,
+      bestEffortDeliver: true,
+    });
+  });
+
+  it("keeps active nested subagent completions steered-only when no explicit role channel is present", async () => {
+    const callGateway = createGatewayMock();
+    const queueEmbeddedAgentMessageWithOutcome = createQueueOutcomeMock(true);
+    testing.setDepsForTest({
+      callGateway,
+      queueEmbeddedAgentMessageWithOutcome,
+      getRequesterSessionActivity: () => ({
+        sessionId: "pm-subagent-session",
+        isActive: true,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:pm:subagent:parent",
+      targetRequesterSessionKey: "agent:pm:subagent:parent",
+      triggerMessage: "backend child done",
+      steerMessage: "backend child done",
+      requesterSessionOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      directOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      completionDirectOrigin: {
+        channel: "discord",
+        accountId: "acct-1",
+        to: "channel:pm",
+      },
+      requesterIsSubagent: true,
+      expectsCompletionMessage: true,
+      bestEffortDeliver: true,
+      directIdempotencyKey: "announce-active-nested-internal",
+      sourceSessionKey: "agent:backend:subagent:child",
+      sourceChannel: "internal",
+      sourceTool: "subagent_announce",
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "steered",
+      enqueuedAt: 4_100,
+      deliveredAt: 4_200,
+    });
+    expect(queueEmbeddedAgentMessageWithOutcome).toHaveBeenCalledOnce();
+    expect(callGateway).not.toHaveBeenCalled();
   });
 
   it("directly delivers direct-message subagent text when the announce agent returns no visible output", async () => {

@@ -17,8 +17,11 @@ import { routeFromConversationRef, routeToDeliveryFields } from "../channels/rou
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isOutboundDeliveryError } from "../infra/outbound/deliver-types.js";
 import type { ConversationRef } from "../infra/outbound/session-binding-service.js";
+import type { SourceDeliveryTarget } from "../infra/outbound/source-delivery-plan.js";
 import { sourceDeliveryTargetsMatch } from "../infra/outbound/source-delivery-plan.js";
+import type { ReplyPayload } from "../auto-reply/reply-payload.js";
 import { stringifyRouteThreadId } from "../plugin-sdk/channel-route.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { normalizeAccountId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import {
@@ -33,6 +36,7 @@ import {
   INTERNAL_MESSAGE_CHANNEL,
   isDeliverableMessageChannel,
   isGatewayMessageChannel,
+  isInternalNonDeliveryChannel,
   isInternalMessageChannel,
   normalizeMessageChannel,
 } from "../utils/message-channel.js";
@@ -54,7 +58,6 @@ import {
   callGateway,
   createBoundDeliveryRouter,
   dispatchGatewayMethodInProcess,
-  getGlobalHookRunner,
   isEmbeddedAgentRunActive,
   isEmbeddedRunAbandoned,
   getRuntimeConfig,
@@ -503,6 +506,7 @@ export async function resolveSubagentCompletionOrigin(params: {
   childRunId?: string;
   spawnMode?: SpawnSubagentMode;
   expectsCompletionMessage: boolean;
+  hooksOnly?: boolean;
 }): Promise<DeliveryContext | undefined> {
   const requesterOrigin = normalizeDeliveryContext(params.requesterOrigin);
   const channel = normalizeOptionalLowercaseString(requesterOrigin?.channel);
@@ -520,6 +524,21 @@ export async function resolveSubagentCompletionOrigin(params: {
     "";
   const requesterConversation: ConversationRef | undefined =
     channel && conversationId ? { channel, accountId, conversationId } : undefined;
+
+  const hookOrigin = await resolveSubagentCompletionHookOrigin({
+    childSessionKey: params.childSessionKey,
+    requesterSessionKey: params.requesterSessionKey,
+    requesterOrigin,
+    childRunId: params.childRunId,
+    spawnMode: params.spawnMode,
+    expectsCompletionMessage: params.expectsCompletionMessage,
+  });
+  if (hookOrigin) {
+    return hookOrigin;
+  }
+  if (params.hooksOnly === true) {
+    return undefined;
+  }
 
   const router = createBoundDeliveryRouter();
   const requesterRoute = router.resolveDestination({
@@ -556,16 +575,27 @@ export async function resolveSubagentCompletionOrigin(params: {
     );
   }
 
+  return requesterOrigin;
+}
+
+async function resolveSubagentCompletionHookOrigin(params: {
+  childSessionKey: string;
+  requesterSessionKey: string;
+  requesterOrigin?: DeliveryContext;
+  childRunId?: string;
+  spawnMode?: SpawnSubagentMode;
+  expectsCompletionMessage: boolean;
+}): Promise<DeliveryContext | undefined> {
   const hookRunner = getGlobalHookRunner();
   if (!hookRunner?.hasHooks("subagent_delivery_target")) {
-    return requesterOrigin;
+    return undefined;
   }
   try {
     const result = await hookRunner.runSubagentDeliveryTarget(
       {
         childSessionKey: params.childSessionKey,
         requesterSessionKey: params.requesterSessionKey,
-        requesterOrigin,
+        requesterOrigin: params.requesterOrigin,
         childRunId: params.childRunId,
         spawnMode: params.spawnMode,
         expectsCompletionMessage: params.expectsCompletionMessage,
@@ -578,15 +608,33 @@ export async function resolveSubagentCompletionOrigin(params: {
     );
     const hookOrigin = normalizeDeliveryContext(result?.origin);
     if (!hookOrigin) {
-      return requesterOrigin;
+      return undefined;
     }
-    if (hookOrigin.channel && isInternalMessageChannel(hookOrigin.channel)) {
-      return requesterOrigin;
+    if (
+      hookOrigin.channel &&
+      (isInternalMessageChannel(hookOrigin.channel) ||
+        isInternalNonDeliveryChannel(hookOrigin.channel))
+    ) {
+      return undefined;
     }
-    return mergeDeliveryContext(hookOrigin, requesterOrigin);
+    return mergeCompletionHookOrigin(hookOrigin, params.requesterOrigin);
   } catch {
-    return requesterOrigin;
+    return undefined;
   }
+}
+
+function mergeCompletionHookOrigin(
+  hookOrigin: DeliveryContext,
+  requesterOrigin?: DeliveryContext,
+): DeliveryContext {
+  const merged = mergeDeliveryContext(hookOrigin, requesterOrigin) ?? hookOrigin;
+  const hookTo = hookOrigin.to?.trim();
+  const requesterTo = requesterOrigin?.to?.trim();
+  if (hookTo && requesterTo && hookTo !== requesterTo && hookOrigin.threadId == null) {
+    const { threadId: _threadId, ...withoutRequesterThread } = merged;
+    return withoutRequesterThread;
+  }
+  return merged;
 }
 
 export function loadRequesterSessionEntry(requesterSessionKey: string) {
@@ -677,6 +725,46 @@ function hasVisibleNonSilentGatewayAgentPayload(response: unknown): boolean {
   }
   const payloads = Array.isArray(result.payloads) ? result.payloads : [];
   return payloads.some(isVisibleNonSilentGatewayAgentPayload);
+}
+
+function normalizeVisibleReplyPayload(payload: unknown): ReplyPayload | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const record = payload as ReplyPayload;
+  if (record.isReasoning === true || record.isError === true) {
+    return undefined;
+  }
+  const text = typeof record.text === "string" ? record.text.trim() : "";
+  const mediaUrl = typeof record.mediaUrl === "string" ? record.mediaUrl.trim() : "";
+  const mediaUrls = Array.isArray(record.mediaUrls)
+    ? record.mediaUrls.filter((url): url is string => typeof url === "string" && url.trim() !== "")
+    : [];
+  const hasRichPayload = Boolean(record.presentation || record.interactive || record.channelData);
+  if (!text && !mediaUrl && mediaUrls.length === 0 && !hasRichPayload) {
+    return undefined;
+  }
+  if (text && isSilentReplyPayloadText(text, SILENT_REPLY_TOKEN)) {
+    return undefined;
+  }
+  return {
+    ...(text ? { text } : {}),
+    ...(mediaUrl ? { mediaUrl } : {}),
+    ...(mediaUrls.length > 0 ? { mediaUrls } : {}),
+    ...(record.presentation ? { presentation: record.presentation } : {}),
+    ...(record.interactive ? { interactive: record.interactive } : {}),
+    ...(record.channelData ? { channelData: record.channelData } : {}),
+  };
+}
+
+function collectVisibleReplyPayloads(response: unknown): ReplyPayload[] {
+  const result = getGatewayAgentResult(response);
+  if (!result || !Array.isArray(result.payloads)) {
+    return [];
+  }
+  return result.payloads
+    .map((payload) => normalizeVisibleReplyPayload(payload))
+    .filter((payload): payload is ReplyPayload => Boolean(payload));
 }
 
 function isVisibleNonSilentGatewayAgentPayload(payload: unknown): boolean {
@@ -799,6 +887,98 @@ function collectExpectedMediaFromInternalEvents(
 function getGatewayAgentCommandDeliveryFailure(response: unknown): string | undefined {
   const result = getGatewayAgentResult(response);
   return result ? getAgentCommandDeliveryFailure(result) : undefined;
+}
+
+function deliveryTargetsEquivalent(
+  left: SourceDeliveryTarget & { deliver?: boolean },
+  right: SourceDeliveryTarget & { deliver?: boolean },
+): boolean {
+  if (!left.channel || !left.to || !right.channel || !right.to) {
+    return false;
+  }
+  return (
+    sourceDeliveryTargetsMatch(
+      {
+        provider: left.channel,
+        accountId: left.accountId,
+        to: left.to,
+        threadId: stringifyRouteThreadId(left.threadId),
+      },
+      right,
+    ) &&
+    sourceDeliveryTargetsMatch(
+      {
+        provider: right.channel,
+        accountId: right.accountId,
+        to: right.to,
+        threadId: stringifyRouteThreadId(right.threadId),
+      },
+      left,
+    )
+  );
+}
+
+async function deliverRequesterCompletionCopy(params: {
+  cfg: OpenClawConfig;
+  requesterSessionKey: string;
+  directIdempotencyKey: string;
+  primaryTarget: SourceDeliveryTarget & { deliver?: boolean };
+  requesterTarget: SourceDeliveryTarget & { deliver?: boolean };
+  announceResponse: unknown;
+  signal?: AbortSignal;
+}): Promise<SubagentAnnounceDeliveryResult | undefined> {
+  if (
+    params.signal?.aborted ||
+    !params.primaryTarget.deliver ||
+    !params.requesterTarget.deliver ||
+    !params.requesterTarget.channel ||
+    !params.requesterTarget.to ||
+    deliveryTargetsEquivalent(params.primaryTarget, params.requesterTarget)
+  ) {
+    return undefined;
+  }
+  const payloads = collectVisibleReplyPayloads(params.announceResponse);
+  if (payloads.length === 0) {
+    return undefined;
+  }
+  const agentId = resolveAgentIdFromSessionKey(params.requesterSessionKey);
+  const idempotencyKey = `${params.directIdempotencyKey}:requester-copy`;
+  const fallbackText = payloads
+    .map((payload) => payload.text?.trim())
+    .filter((text): text is string => Boolean(text))
+    .join("\n\n");
+  try {
+    await subagentAnnounceDeliveryDeps.sendMessage({
+      cfg: params.cfg,
+      channel: params.requesterTarget.channel,
+      to: params.requesterTarget.to,
+      accountId: params.requesterTarget.accountId,
+      threadId: params.requesterTarget.threadId,
+      requesterSessionKey: params.requesterSessionKey,
+      agentId,
+      content: fallbackText,
+      payloads,
+      idempotencyKey,
+      mirror: {
+        sessionKey: params.requesterSessionKey,
+        agentId,
+        idempotencyKey,
+      },
+      abortSignal: params.signal,
+    });
+    return {
+      delivered: true,
+      path: "direct",
+    };
+  } catch (err) {
+    const terminal = didVisibleSendFailAfterPartialDelivery(err);
+    return {
+      delivered: false,
+      path: "direct",
+      error: `requester completion copy failed: ${summarizeDeliveryError(err)}`,
+      ...(terminal ? { terminal: true } : {}),
+    };
+  }
 }
 
 function isGatewayAgentRunPending(response: unknown): boolean {
@@ -1252,6 +1432,7 @@ async function sendSubagentAnnounceDirectly(params: {
   bestEffortDeliver?: boolean;
   directIdempotencyKey: string;
   completionDirectOrigin?: DeliveryContext;
+  completionDirectOriginExplicit?: boolean;
   directOrigin?: DeliveryContext;
   requesterSessionOrigin?: DeliveryContext;
   sourceSessionKey?: string;
@@ -1287,13 +1468,19 @@ async function sendSubagentAnnounceDirectly(params: {
       requesterSessionOrigin,
     );
     const effectiveDirectOrigin = params.expectsCompletionMessage
-      ? mergeDeliveryContext(externalCompletionDirectOrigin, completionExternalFallbackOrigin)
+      ? externalCompletionDirectOrigin
+        ? mergeCompletionHookOrigin(externalCompletionDirectOrigin, completionExternalFallbackOrigin)
+        : completionExternalFallbackOrigin
       : directOrigin;
     const sessionOnlyOrigin = effectiveDirectOrigin?.channel
       ? effectiveDirectOrigin
       : requesterSessionOrigin;
     const requesterEntry = loadRequesterSessionEntry(params.targetRequesterSessionKey).entry;
-    const deliveryTarget = !params.requesterIsSubagent
+    const hasExplicitExternalCompletionOrigin =
+      params.expectsCompletionMessage &&
+      params.completionDirectOriginExplicit === true &&
+      Boolean(externalCompletionDirectOrigin?.channel && externalCompletionDirectOrigin?.to);
+    const deliveryTarget = !params.requesterIsSubagent || hasExplicitExternalCompletionOrigin
       ? resolveExternalBestEffortDeliveryTarget({
           channel: effectiveDirectOrigin?.channel,
           to: effectiveDirectOrigin?.to,
@@ -1301,6 +1488,15 @@ async function sendSubagentAnnounceDirectly(params: {
           threadId: effectiveDirectOrigin?.threadId,
         })
       : { deliver: false };
+    const requesterCopyTarget =
+      params.expectsCompletionMessage && !params.requesterIsSubagent
+        ? resolveExternalBestEffortDeliveryTarget({
+            channel: completionExternalFallbackOrigin?.channel,
+            to: completionExternalFallbackOrigin?.to,
+            accountId: completionExternalFallbackOrigin?.accountId,
+            threadId: completionExternalFallbackOrigin?.threadId,
+          })
+        : { deliver: false };
     const normalizedSessionOnlyOriginChannel = !params.requesterIsSubagent
       ? normalizeMessageChannel(sessionOnlyOrigin?.channel)
       : undefined;
@@ -1421,20 +1617,25 @@ async function sendSubagentAnnounceDirectly(params: {
         params.signal,
       );
       if (wakeOutcome.queued) {
-        return {
-          delivered: true,
-          deliveredAt: wakeOutcome.deliveredAtMs,
-          enqueuedAt: wakeOutcome.enqueuedAtMs,
-          path: "steered",
-        };
+        if (!hasExplicitExternalCompletionOrigin || !shouldDeliverAgentFinal) {
+          return {
+            delivered: true,
+            deliveredAt: wakeOutcome.deliveredAtMs,
+            enqueuedAt: wakeOutcome.enqueuedAtMs,
+            path: "steered",
+          };
+        }
+        // Fixed completion routes still need a visible external message even
+        // while the active requester receives the internal orchestration wake.
+      } else {
+        activeRequesterWakeFailed = true;
+        defaultRuntime.log(
+          `[warn] Active requester session could not be woken for subagent completion; falling back to requester-agent handoff: ${formatQueueWakeFailureError(
+            "active requester session could not be woken",
+            wakeOutcome,
+          )}`,
+        );
       }
-      activeRequesterWakeFailed = true;
-      defaultRuntime.log(
-        `[warn] Active requester session could not be woken for subagent completion; falling back to requester-agent handoff: ${formatQueueWakeFailureError(
-          "active requester session could not be woken",
-          wakeOutcome,
-        )}`,
-      );
     }
     if (
       params.expectsCompletionMessage &&
@@ -1690,6 +1891,21 @@ async function sendSubagentAnnounceDirectly(params: {
       };
     }
 
+    if (params.expectsCompletionMessage && shouldDeliverAgentFinal) {
+      const requesterCopy = await deliverRequesterCompletionCopy({
+        cfg,
+        requesterSessionKey: canonicalRequesterSessionKey,
+        directIdempotencyKey: params.directIdempotencyKey,
+        primaryTarget: deliveryTarget,
+        requesterTarget: requesterCopyTarget,
+        announceResponse: directAnnounceResponse,
+        signal: params.signal,
+      });
+      if (requesterCopy && !requesterCopy.delivered) {
+        return requesterCopy;
+      }
+    }
+
     return {
       delivered: true,
       path: "direct",
@@ -1713,6 +1929,7 @@ export async function deliverSubagentAnnouncement(params: {
   requesterSessionOrigin?: DeliveryContext;
   requesterOrigin?: DeliveryContext;
   completionDirectOrigin?: DeliveryContext;
+  completionDirectOriginExplicit?: boolean;
   directOrigin?: DeliveryContext;
   sourceSessionKey?: string;
   sourceChannel?: string;
@@ -1749,6 +1966,7 @@ export async function deliverSubagentAnnouncement(params: {
         sourceSessionKey: params.sourceSessionKey,
         sourceChannel: params.sourceChannel,
         sourceTool: params.sourceTool,
+        completionDirectOriginExplicit: params.completionDirectOriginExplicit,
         requesterIsSubagent: params.requesterIsSubagent,
         expectsCompletionMessage: params.expectsCompletionMessage,
         signal: params.signal,

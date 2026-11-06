@@ -5,6 +5,7 @@ import {
   formatThreadBindingSpawnDisabledError,
   resolveThreadBindingSpawnPolicy,
 } from "openclaw/plugin-sdk/conversation-runtime";
+import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalStringifiedId,
@@ -82,6 +83,39 @@ type DiscordSubagentDeliveryTargetResult =
       };
     }
   | undefined;
+
+function normalizeDiscordChannelTarget(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  const idSource = trimmed.toLowerCase().startsWith("channel:")
+    ? trimmed.slice("channel:".length)
+    : trimmed;
+  const id = normalizeOptionalStringifiedId(idSource);
+  return id ? `channel:${id}` : undefined;
+}
+
+function resolveSubagentChannelTarget(params: {
+  cfg: OpenClawPluginApi["config"];
+  accountId?: string;
+  childSessionKey: string;
+}): string | undefined {
+  const agentId = parseAgentSessionKey(params.childSessionKey)?.agentId;
+  if (!agentId) {
+    return undefined;
+  }
+  const discordConfig = params.cfg.channels?.discord;
+  const accountRoutes = params.accountId
+    ? discordConfig?.accounts?.[params.accountId]?.subagentChannels
+    : undefined;
+  const rootRoutes = discordConfig?.subagentChannels;
+  const routes = accountRoutes ?? rootRoutes;
+  if (!routes || routes.enabled === false) {
+    return undefined;
+  }
+  return normalizeDiscordChannelTarget(routes.agents?.[agentId]);
+}
 
 function normalizeThreadBindingTargetKind(raw?: string): ThreadBindingTargetKind | undefined {
   const normalized = normalizeOptionalLowercaseString(raw);
@@ -181,6 +215,7 @@ export function handleDiscordSubagentEnded(event: DiscordSubagentEndedEvent) {
 }
 
 export function handleDiscordSubagentDeliveryTarget(
+  api: OpenClawPluginApi,
   event: DiscordSubagentDeliveryTargetEvent,
 ): DiscordSubagentDeliveryTargetResult {
   if (!event.expectsCompletionMessage) {
@@ -191,6 +226,20 @@ export function handleDiscordSubagentDeliveryTarget(
     return undefined;
   }
   const requesterAccountId = event.requesterOrigin?.accountId?.trim();
+  const configuredSubagentTarget = resolveSubagentChannelTarget({
+    cfg: api.config,
+    accountId: requesterAccountId,
+    childSessionKey: event.childSessionKey,
+  });
+  if (configuredSubagentTarget) {
+    return {
+      origin: {
+        channel: "discord" as const,
+        ...(requesterAccountId ? { accountId: requesterAccountId } : {}),
+        to: configuredSubagentTarget,
+      },
+    };
+  }
   const requesterThreadId =
     event.requesterOrigin?.threadId != null && event.requesterOrigin.threadId !== ""
       ? (normalizeOptionalStringifiedId(event.requesterOrigin.threadId) ?? "")

@@ -99,12 +99,15 @@ async function resolveSubagentDeliveryTargetForTest(requesterOrigin: {
   accountId: string;
   to: string;
   threadId?: string;
+}, options?: {
+  childSessionKey?: string;
+  config?: Record<string, unknown>;
 }) {
-  const handlers = registerHandlersForTest();
+  const handlers = registerHandlersForTest(options?.config);
   const handler = getRequiredHookHandler(handlers, "subagent_delivery_target");
   return await handler(
     {
-      childSessionKey: "agent:main:subagent:child",
+      childSessionKey: options?.childSessionKey ?? "agent:main:subagent:child",
       requesterSessionKey: "agent:main:main",
       requesterOrigin,
       childRunId: "run-1",
@@ -450,6 +453,80 @@ describe("discord subagent hook handlers", () => {
         accountId: "work",
         to: "channel:777",
         threadId: "777",
+      },
+    });
+  });
+
+  it("routes subagent completion to configured agent channel before thread bindings", async () => {
+    const result = await resolveSubagentDeliveryTargetForTest(
+      {
+        channel: "discord",
+        accountId: "work",
+        to: "channel:123",
+      },
+      {
+        childSessionKey: "agent:pm:subagent:child",
+        config: {
+          channels: {
+            discord: {
+              subagentChannels: {
+                agents: {
+                  pm: "1507284409391513741",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(hookMocks.listThreadBindingsBySessionKey).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      origin: {
+        channel: "discord",
+        accountId: "work",
+        to: "channel:1507284409391513741",
+      },
+    });
+  });
+
+  it("honors account-level subagent channel routing override", async () => {
+    const result = await resolveSubagentDeliveryTargetForTest(
+      {
+        channel: "discord",
+        accountId: "work",
+        to: "channel:123",
+      },
+      {
+        childSessionKey: "agent:pm:subagent:child",
+        config: {
+          channels: {
+            discord: {
+              subagentChannels: {
+                agents: {
+                  pm: "1507284409391513741",
+                },
+              },
+              accounts: {
+                work: {
+                  subagentChannels: {
+                    agents: {
+                      pm: "1507284407810265131",
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      origin: {
+        channel: "discord",
+        accountId: "work",
+        to: "channel:1507284407810265131",
       },
     });
   });

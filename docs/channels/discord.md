@@ -808,6 +808,30 @@ Default slash command settings:
 
   </Accordion>
 
+  <Accordion title="Fixed role channels for subagents">
+    To deliver subagent completion messages into stable Discord role channels instead of the requester channel, map configured agent ids with `channels.discord.subagentChannels.agents`. The parent agent must spawn those workers with explicit `sessions_spawn.agentId` values.
+
+```json5
+{
+  channels: {
+    discord: {
+      subagentChannels: {
+        agents: {
+          pm: "1507284409391513741",
+          frontend: "1507284411908100156",
+          security: "1507284414864822352",
+        },
+      },
+    },
+  },
+}
+```
+
+    Account-specific overrides can be set under `channels.discord.accounts.<accountId>.subagentChannels`.
+
+    Live Discord smoke tests for this path need a real user-authored message. Bot or webhook-authored messages have `author.bot=true` or webhook metadata and are rejected when `allowBots=false`, so they are not a valid substitute for the operator input that starts role-channel orchestration.
+  </Accordion>
+
   <Accordion title="Persistent ACP channel bindings">
     For stable "always-on" ACP workspaces, configure top-level typed ACP bindings targeting Discord conversations.
 

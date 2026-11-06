@@ -293,6 +293,13 @@ export type DiscordThreadBindingsConfig = {
   spawnAcpSessions?: boolean;
 };
 
+export type DiscordSubagentChannelsConfig = {
+  /** Enable fixed Discord channel delivery for subagent completion messages. Default: true when agents are configured. */
+  enabled?: boolean;
+  /** Map configured agent ids to Discord channel ids for subagent completion delivery. */
+  agents?: Record<string, string>;
+};
+
 export type DiscordSlashCommandConfig = {
   /** Reply ephemerally (default: true). */
   ephemeral?: boolean;
@@ -437,6 +444,8 @@ export type DiscordAccountConfig = {
   slashCommand?: DiscordSlashCommandConfig;
   /** Thread binding lifecycle settings (focus/subagent thread sessions). */
   threadBindings?: DiscordThreadBindingsConfig;
+  /** Fixed channel delivery for subagent completion messages by configured agent id. */
+  subagentChannels?: DiscordSubagentChannelsConfig;
   /** Privileged Gateway Intents (must also be enabled in Discord Developer Portal). */
   intents?: DiscordIntentsConfig;
   /** Voice channel conversation settings. */

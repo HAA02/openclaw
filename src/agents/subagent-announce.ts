@@ -543,7 +543,7 @@ export async function runSubagentAnnounceFlow(params: {
       directOrigin = resolveAnnounceOrigin(entry, targetRequesterOrigin);
     }
     const completionDirectOrigin =
-      expectsCompletionMessage && !requesterIsSubagent
+      expectsCompletionMessage
         ? await resolveSubagentCompletionOrigin({
             childSessionKey: params.childSessionKey,
             requesterSessionKey: targetRequesterSessionKey,
@@ -551,8 +551,11 @@ export async function runSubagentAnnounceFlow(params: {
             childRunId: params.childRunId,
             spawnMode: params.spawnMode,
             expectsCompletionMessage,
+            hooksOnly: requesterIsSubagent,
           })
         : targetRequesterOrigin;
+    const completionDirectOriginExplicit =
+      expectsCompletionMessage && requesterIsSubagent && Boolean(completionDirectOrigin);
     const directIdempotencyKey = buildAnnounceIdempotencyKey(announceId);
     const delivery = await deliverSubagentAnnouncement({
       requesterSessionKey: targetRequesterSessionKey,
@@ -566,7 +569,8 @@ export async function runSubagentAnnounceFlow(params: {
         expectsCompletionMessage && !requesterIsSubagent
           ? completionDirectOrigin
           : targetRequesterOrigin,
-      completionDirectOrigin,
+      completionDirectOrigin: completionDirectOrigin ?? targetRequesterOrigin,
+      completionDirectOriginExplicit,
       directOrigin,
       sourceSessionKey: params.childSessionKey,
       sourceChannel: INTERNAL_MESSAGE_CHANNEL,

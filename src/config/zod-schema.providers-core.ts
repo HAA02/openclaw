@@ -746,6 +746,13 @@ export const DiscordAccountSchema = z
       })
       .strict()
       .optional(),
+    subagentChannels: z
+      .object({
+        enabled: z.boolean().optional(),
+        agents: z.record(z.string(), DiscordSnowflakeStringSchema).optional(),
+      })
+      .strict()
+      .optional(),
     intents: z
       .object({
         presence: z.boolean().optional(),
